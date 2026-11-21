@@ -4,7 +4,7 @@
 
 Built clean-room for the **Gemini 4 NYC Hackathon** (*Problem Statement One: "5 Sigma"* + *Best Use of Managed Agents*), RoboHarness watches **any** short human video — a live 5-second webcam recording of a judge or an uploaded MP4 (e.g., a Fortnite dance) — analyzes it with **Agentic Video Processing** (`processing="agentic"`), retargets and physics-verifies 16-DOF trajectories inside a forked Google Managed Agent sandbox (`gemini-4-neon` with automatic escalation to `gemini-4-carbon`), gates safety and fidelity with the **0-output-token Decisions API** (`confidence >= 0.75` and `is_physically_safe >= 0.75`), saves SHA-256 signed reusable skills, and executes live on a physical TonyPi robot exclusively over **Streamable HTTP MCP**.
 
-> **1-Minute Demo Video**: _YouTube link dropping shortly — live physical Hiwonder TonyPi + MuJoCo 4.0.1 Studio demo_
+> **1-Minute Demo Video**: [Watch on YouTube (1080p MuJoCo 4.0.1 Physics + Gemini 4 Pipeline)](https://www.youtube.com/watch?v=t268LBaSmYw)
 
 ### Judge Quick-Scan — Headline Live 5 Sigma Proof
 
@@ -19,7 +19,7 @@ Live 12-scenario evaluation on real Gemini 4 Dual-Client APIs (`v1` + `v1beta`) 
 | **Mean Fidelity (Executable, 0–3)** | 1.30 / 3.00 | **2.20 / 3.00** | **+0.89** |
 | **Decisions API Output Tokens (`v1beta`)** | n/a | **0** | **0 tokens** |
 
-*Offline verification: **141/141 tests passing** (`uv run pytest -q`, zero hardware or API keys required) · **0 ruff lint issues** · **MIT Licensed** ([`LICENSE`](LICENSE)).*
+*Offline verification: **142/142 tests passing** (`uv run pytest -q`, zero hardware or API keys required) · **0 ruff lint issues** · **MIT Licensed** ([`LICENSE`](LICENSE)).*
 
 ---
 
