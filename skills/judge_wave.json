@@ -1,0 +1,332 @@
+{
+  "schema_version": "1.0",
+  "name": "judge_wave",
+  "created_at": "2026-11-21T21:40:19.787683+00:00",
+  "source_video": "/var/folders/fq/rvpy1w1d16ngk7sf8c2gzs440000gn/T/roboharness_clip_1795297098.mp4",
+  "description": "Friendly right-hand side-to-side wave greeting from a grounded neutral stance, returning to rest.",
+  "adaptation_mode": "full_body",
+  "keyframes": [
+    {
+      "duration_ms": 400,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 516,
+        "r_shoulder_roll": 532,
+        "r_elbow": 548,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "neutral_start"
+    },
+    {
+      "duration_ms": 600,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 772,
+        "r_shoulder_roll": 612,
+        "r_elbow": 756,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "raise_right_arm"
+    },
+    {
+      "duration_ms": 200,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 836,
+        "r_shoulder_roll": 570,
+        "r_elbow": 820,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "wave_inward_1"
+    },
+    {
+      "duration_ms": 200,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 850,
+        "r_shoulder_roll": 644,
+        "r_elbow": 788,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "wave_outward_1"
+    },
+    {
+      "duration_ms": 400,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 846,
+        "r_shoulder_roll": 577,
+        "r_elbow": 820,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "wave_inward_2"
+    },
+    {
+      "duration_ms": 200,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 850,
+        "r_shoulder_roll": 641,
+        "r_elbow": 788,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "wave_outward_2"
+    },
+    {
+      "duration_ms": 200,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 846,
+        "r_shoulder_roll": 580,
+        "r_elbow": 820,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "wave_inward_3"
+    },
+    {
+      "duration_ms": 200,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 850,
+        "r_shoulder_roll": 644,
+        "r_elbow": 788,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "wave_outward_3"
+    },
+    {
+      "duration_ms": 600,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 836,
+        "r_shoulder_roll": 634,
+        "r_elbow": 794,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "wave_outward_4"
+    },
+    {
+      "duration_ms": 400,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 676,
+        "r_shoulder_roll": 580,
+        "r_elbow": 708,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "lower_right_arm"
+    },
+    {
+      "duration_ms": 600,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 516,
+        "r_shoulder_roll": 532,
+        "r_elbow": 548,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 484,
+        "l_shoulder_roll": 468,
+        "l_elbow": 452
+      },
+      "note": "neutral_end"
+    }
+  ],
+  "kinematics": {
+    "verified": true,
+    "peak_torso_tilt_deg": 3.58,
+    "max_com_offset_norm": 0.119,
+    "joint_clipping_count": 0,
+    "max_slew_rate_pps": 426.7,
+    "lower_body_adapted": false,
+    "adaptation_notes": [],
+    "violations": [],
+    "sandbox_environment_id": "9e55b3df6096d535850f739280f0096e"
+  },
+  "decision_gate": {
+    "is_physically_safe_prob": 0.9620939166800284,
+    "is_physically_safe_conf": 0.9620939166800284,
+    "needs_lower_body_adaptation_prob": 0.05166739276180751,
+    "needs_lower_body_adaptation_conf": 0.9483326072381925,
+    "move_fidelity_score": 2.3042832467053262,
+    "move_fidelity_legend": {
+      "0": "0: Unrecognizable, broken/unsafe, or completely mismatched to the target motion.",
+      "2": "2: Recognizable, rhythmically aligned adaptation preserving the main motion essence.",
+      "1": "1: Minimal resemblance; core rhythm, timing, or upper-body silhouette is mostly lost.",
+      "3": "3: High-fidelity, beat-synced retargeting capturing the signature style and timing."
+    },
+    "move_fidelity_conf": 0.4559998377240305,
+    "route": "execute_and_save",
+    "route_probabilities": {
+      "adapt_upper_body_only": 0.02061604768958627,
+      "execute_and_save": 0.9514005875449156,
+      "other": 0.004686408148052778,
+      "repair_in_forge": 0.01676290209828182,
+      "refuse_impossible": 0.006534054519163436
+    },
+    "route_conf": 0.9514005875449156,
+    "min_confidence": 0.9514005875449156,
+    "auto_branch_allowed": true,
+    "effective_action": "execute_and_save",
+    "raw_answers": {
+      "move_fidelity": {
+        "confidence": 0.4559998377240305,
+        "legend": {
+          "0": "0: Unrecognizable, broken/unsafe, or completely mismatched to the target motion.",
+          "2": "2: Recognizable, rhythmically aligned adaptation preserving the main motion essence.",
+          "1": "1: Minimal resemblance; core rhythm, timing, or upper-body silhouette is mostly lost.",
+          "3": "3: High-fidelity, beat-synced retargeting capturing the signature style and timing."
+        },
+        "probabilities": {
+          "2": 0.4133846187992525,
+          "1": 0.1095144959347294,
+          "0": 0.02110104754198764,
+          "3": 0.4559998377240305
+        },
+        "score": 2.3042832467053262,
+        "type": "score"
+      },
+      "route": {
+        "choice": "execute_and_save",
+        "confidence": 0.9514005875449156,
+        "probabilities": {
+          "adapt_upper_body_only": 0.02061604768958627,
+          "execute_and_save": 0.9514005875449156,
+          "other": 0.004686408148052778,
+          "repair_in_forge": 0.01676290209828182,
+          "refuse_impossible": 0.006534054519163436
+        },
+        "type": "choice"
+      },
+      "needs_lower_body_adaptation": {
+        "confidence": 0.9483326072381925,
+        "noul": 0.05166739276180751,
+        "type": "noul"
+      },
+      "is_physically_safe": {
+        "confidence": 0.9620939166800284,
+        "noul": 0.9620939166800284,
+        "type": "noul"
+      }
+    }
+  },
+  "post_run_fidelity_score": 1.9565997093737049,
+  "artifact_sha256": "636b9834517a894ff71586ed92799a64bc371d9c180db3b40e543fd7a006d43e"
+}

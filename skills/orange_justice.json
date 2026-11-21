@@ -1,0 +1,225 @@
+{
+  "schema_version": "1.0",
+  "name": "orange_justice",
+  "created_at": "2026-11-21T21:41:55.466899+00:00",
+  "source_video": "scenario:dance_orange_justice",
+  "description": "High-energy Orange Justice arm claps and diagonal swings with grounded rhythmic knee-bounce adaptation replacing the mid-bar hop",
+  "adaptation_mode": "upper_body_adapted",
+  "keyframes": [
+    {
+      "duration_ms": 400,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 516,
+        "r_knee": 532,
+        "r_hip_pitch": 484,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 388,
+        "r_shoulder_roll": 372,
+        "r_elbow": 612,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 516,
+        "l_knee": 532,
+        "l_hip_pitch": 484,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 196,
+        "l_shoulder_roll": 324,
+        "l_elbow": 356
+      },
+      "note": "beat 0: wide_diagonal_left with grounded knee bounce"
+    },
+    {
+      "duration_ms": 500,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 514,
+        "r_knee": 528,
+        "r_hip_pitch": 486,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 804,
+        "r_shoulder_roll": 676,
+        "r_elbow": 644,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 514,
+        "l_knee": 528,
+        "l_hip_pitch": 486,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 612,
+        "l_shoulder_roll": 628,
+        "l_elbow": 388
+      },
+      "note": "beat 1: wide_diagonal_right with grounded knee bounce"
+    },
+    {
+      "duration_ms": 550,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 520,
+        "r_knee": 540,
+        "r_hip_pitch": 480,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 850,
+        "r_shoulder_roll": 276,
+        "r_elbow": 596,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 520,
+        "l_knee": 540,
+        "l_hip_pitch": 480,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 150,
+        "l_shoulder_roll": 276,
+        "l_elbow": 404
+      },
+      "note": "beat 2: grounded symmetric knee bounce replacing mid_bar_hop_clap with high clap arms"
+    },
+    {
+      "duration_ms": 500,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 515,
+        "r_knee": 530,
+        "r_hip_pitch": 485,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 436,
+        "r_shoulder_roll": 388,
+        "r_elbow": 724,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 515,
+        "l_knee": 530,
+        "l_hip_pitch": 485,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 308,
+        "l_shoulder_roll": 356,
+        "l_elbow": 260
+      },
+      "note": "beat 3: landing_clap_left grounded"
+    },
+    {
+      "duration_ms": 500,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 512,
+        "r_knee": 524,
+        "r_hip_pitch": 488,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 772,
+        "r_shoulder_roll": 660,
+        "r_elbow": 644,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 512,
+        "l_knee": 524,
+        "l_hip_pitch": 488,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 548,
+        "l_shoulder_roll": 580,
+        "l_elbow": 308
+      },
+      "note": "beat 4: groove_right grounded"
+    },
+    {
+      "duration_ms": 600,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 504,
+        "r_knee": 508,
+        "r_hip_pitch": 496,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 500,
+        "r_shoulder_roll": 500,
+        "r_elbow": 548,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 504,
+        "l_knee": 508,
+        "l_hip_pitch": 496,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 500,
+        "l_shoulder_roll": 500,
+        "l_elbow": 452
+      },
+      "note": "beat 5: recover_stance"
+    }
+  ],
+  "kinematics": {
+    "verified": true,
+    "peak_torso_tilt_deg": 4.0,
+    "max_com_offset_norm": 0.133,
+    "joint_clipping_count": 0,
+    "max_slew_rate_pps": 840.0,
+    "lower_body_adapted": true,
+    "adaptation_notes": [
+      "Replaced airborne mid-bar hop at 1000ms with a grounded symmetric knee bounce (knees 508..540 with counter-pitched hips and ankles) to prevent slipping and keep torso tilt safely under 30 deg.",
+      "Extended beat 2 transition duration to 550ms to keep shoulder pitch slew rate strictly below 900 pulses/sec."
+    ],
+    "violations": [],
+    "sandbox_environment_id": "868ff8df1ff2982adf06eaa39afb84e7"
+  },
+  "decision_gate": {
+    "is_physically_safe_prob": 0.9623834195108868,
+    "is_physically_safe_conf": 0.9623834195108868,
+    "needs_lower_body_adaptation_prob": 0.3021912995043127,
+    "needs_lower_body_adaptation_conf": 0.6978087004956872,
+    "move_fidelity_score": 2.597957913478039,
+    "move_fidelity_legend": {
+      "1": "1: Minimal resemblance; core rhythm, timing, or upper-body silhouette is mostly lost.",
+      "3": "3: High-fidelity, beat-synced retargeting capturing the signature style and timing.",
+      "2": "2: Recognizable, rhythmically aligned adaptation preserving the main motion essence.",
+      "0": "0: Unrecognizable, broken/unsafe, or completely mismatched to the target motion."
+    },
+    "move_fidelity_conf": 0.6315987302733186,
+    "route": "execute_and_save",
+    "route_probabilities": {
+      "refuse_impossible": 0.004510549433499403,
+      "adapt_upper_body_only": 0.11069770543463825,
+      "execute_and_save": 0.8710488299260055,
+      "other": 0.0035431607878442916,
+      "repair_in_forge": 0.010199754418012465
+    },
+    "route_conf": 0.8710488299260055,
+    "min_confidence": 0.8710488299260055,
+    "auto_branch_allowed": true,
+    "effective_action": "execute_and_save",
+    "raw_answers": {
+      "needs_lower_body_adaptation": {
+        "confidence": 0.6978087004956872,
+        "noul": 0.3021912995043127,
+        "type": "noul"
+      },
+      "route": {
+        "choice": "execute_and_save",
+        "confidence": 0.8710488299260055,
+        "probabilities": {
+          "refuse_impossible": 0.004510549433499403,
+          "adapt_upper_body_only": 0.11069770543463825,
+          "execute_and_save": 0.8710488299260055,
+          "other": 0.0035431607878442916,
+          "repair_in_forge": 0.010199754418012465
+        },
+        "type": "choice"
+      },
+      "is_physically_safe": {
+        "confidence": 0.9623834195108868,
+        "noul": 0.9623834195108868,
+        "type": "noul"
+      },
+      "move_fidelity": {
+        "confidence": 0.6315987302733186,
+        "legend": {
+          "1": "1: Minimal resemblance; core rhythm, timing, or upper-body silhouette is mostly lost.",
+          "3": "3: High-fidelity, beat-synced retargeting capturing the signature style and timing.",
+          "2": "2: Recognizable, rhythmically aligned adaptation preserving the main motion essence.",
+          "0": "0: Unrecognizable, broken/unsafe, or completely mismatched to the target motion."
+        },
+        "probabilities": {
+          "1": 0.027356047614942806,
+          "0": 0.0031423845901684465,
+          "2": 0.3379028375215702,
+          "3": 0.6315987302733186
+        },
+        "score": 2.597957913478039,
+        "type": "score"
+      }
+    }
+  },
+  "post_run_fidelity_score": 2.038814593676714,
+  "artifact_sha256": "18fe7b1aea2f3f5adf0e5c75971e52480b81e18fbba96fb5afac25abe1e8989e"
+}

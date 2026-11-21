@@ -573,3 +573,122 @@ def test_real_tonypi_mcp_nested_state_status_and_play_frames_servo_ids() -> None
         assert play_calls[0]["guard_tilt_deg"] == pytest.approx(30.0, abs=0.01)
         assert play_calls[0]["hold_s"] == pytest.approx(0.5, abs=0.01)
         assert play_calls[0]["wait"] is True
+
+
+def test_real_tonypi_mcp_get_joints_calibration_delta_and_return_to_stand() -> None:
+    """When `get_joints` is advertised alongside `play_frames`, project relative deltas onto live stand pose."""
+    base_stand = {
+        "1": 500,
+        "2": 390,
+        "3": 500,
+        "4": 595,
+        "5": 500,
+        "6": 566,
+        "7": 799,
+        "8": 724,
+        "9": 500,
+        "10": 610,
+        "11": 500,
+        "12": 405,
+        "13": 500,
+        "14": 430,
+        "15": 201,
+        "16": 277,
+    }
+    play_calls: list[dict[str, Any]] = []
+
+    def _calibrated_handler(request: httpx.Request) -> httpx.Response:
+        msg = json.loads(request.content.decode("utf-8"))
+        method = msg["method"]
+        req_id = msg.get("id")
+        if method == "notifications/initialized":
+            return httpx.Response(202, headers={"Mcp-Session-Id": "tonypi-cal"})
+        if method == "initialize":
+            res: dict[str, Any] = {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "tonypi-mcp", "version": "1.0.0"},
+            }
+        elif method == "tools/list":
+            res = {
+                "tools": [
+                    {"name": "status", "inputSchema": {"type": "object", "properties": {}}},
+                    {"name": "get_joints", "inputSchema": {"type": "object", "properties": {}}},
+                    {
+                        "name": "play_frames",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "frames": {"type": "array"},
+                                "hold_s": {"type": "number"},
+                                "guard_tilt_deg": {"type": "number"},
+                                "wait": {"type": "boolean"},
+                            },
+                            "required": ["frames"],
+                        },
+                    },
+                ]
+            }
+        elif method == "tools/call" and msg["params"]["name"] == "status":
+            payload = {
+                "profile": "learning",
+                "state": {
+                    "tilt_deg": 2.0,
+                    "lying": False,
+                    "asleep": False,
+                    "battery_mv": 11400,
+                    "hottest": [8, "left shoulder", 34],
+                    "stop_latched": False,
+                },
+            }
+            res = {"content": [{"type": "text", "text": json.dumps(payload)}]}
+        elif method == "tools/call" and msg["params"]["name"] == "get_joints":
+            res = {"content": [{"type": "text", "text": json.dumps({"pos": dict(base_stand)})}]}
+        else:
+            args = msg["params"]["arguments"]
+            play_calls.append(args)
+            res = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "ok": True,
+                                "frames_executed": len(args.get("frames", [])),
+                                "peak_tilt_deg": 3.2,
+                            }
+                        ),
+                    }
+                ]
+            }
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json", "Mcp-Session-Id": "tonypi-cal"},
+            json={"jsonrpc": "2.0", "id": req_id, "result": res},
+        )
+
+    skill = _make_safe_skill("cal_wave")
+    with TonypiMCPClient(
+        "http://127.0.0.1:8766/mcp", transport=httpx.MockTransport(_calibrated_handler)
+    ) as client:
+        trace = client.execute_skill(skill)
+        assert trace.aborted is False
+        assert len(play_calls) == 1
+        sent_frames = play_calls[0]["frames"]
+        # 3 skill keyframes + 1 final 500ms return-to-stand settle frame
+        assert len(sent_frames) == 4
+
+        f0_pos = sent_frames[0]["pos"]
+        # r_shoulder_pitch=640 -> delta +140 * (+1.25) = +175 on sid "16" (base 277) -> 452
+        assert f0_pos["16"] == 452
+        # l_shoulder_pitch=360 -> delta -140 * (-1.25) = +175 on sid "8" (base 724) -> clamped 860
+        assert f0_pos["8"] == 860
+        # r_hip_pitch=585 -> delta +85 * (-0.25) = -21.25 on sid "12" (base 405) -> 384
+        assert f0_pos["12"] == 384
+        # l_hip_pitch=585 -> delta +85 * (+0.25) = +21.25 on sid "4" (base 595) -> 616
+        assert f0_pos["4"] == 616
+        # All pulses strictly clamped within [140, 860]
+        assert all(140 <= v <= 860 for v in f0_pos.values())
+
+        # Final settle frame returns cleanly to exact live standing base_pos
+        assert sent_frames[-1] == {"ms": 500, "pos": base_stand}

@@ -1,0 +1,224 @@
+{
+  "schema_version": "1.0",
+  "name": "floss",
+  "created_at": "2026-11-21T21:38:24.637902+00:00",
+  "source_video": "scenario:dance_floss",
+  "description": "Beat-synced floss dance retargeted for TonyPi with exaggerated alternating cross-body arm swings and a stabilized grounded knee-bounce lower body.",
+  "adaptation_mode": "upper_body_adapted",
+  "keyframes": [
+    {
+      "duration_ms": 470,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 512,
+        "r_knee": 524,
+        "r_hip_pitch": 488,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 410,
+        "r_shoulder_roll": 375,
+        "r_elbow": 548,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 512,
+        "l_knee": 524,
+        "l_hip_pitch": 488,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 375,
+        "l_shoulder_roll": 610,
+        "l_elbow": 452
+      },
+      "note": "beat 0: arms_right_hips_left (grounded knee bounce)"
+    },
+    {
+      "duration_ms": 470,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 518,
+        "r_knee": 536,
+        "r_hip_pitch": 482,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 625,
+        "r_shoulder_roll": 610,
+        "r_elbow": 548,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 518,
+        "l_knee": 536,
+        "l_hip_pitch": 482,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 590,
+        "l_shoulder_roll": 375,
+        "l_elbow": 452
+      },
+      "note": "beat 1: arms_left_hips_right (grounded knee bounce)"
+    },
+    {
+      "duration_ms": 470,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 510,
+        "r_knee": 520,
+        "r_hip_pitch": 490,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 645,
+        "r_shoulder_roll": 385,
+        "r_elbow": 548,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 510,
+        "l_knee": 520,
+        "l_hip_pitch": 490,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 615,
+        "l_shoulder_roll": 645,
+        "l_elbow": 452
+      },
+      "note": "beat 2: back_swing_right (grounded knee bounce)"
+    },
+    {
+      "duration_ms": 470,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 519,
+        "r_knee": 538,
+        "r_hip_pitch": 481,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 385,
+        "r_shoulder_roll": 645,
+        "r_elbow": 548,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 519,
+        "l_knee": 538,
+        "l_hip_pitch": 481,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 355,
+        "l_shoulder_roll": 385,
+        "l_elbow": 452
+      },
+      "note": "beat 3: front_swing_left (grounded knee bounce)"
+    },
+    {
+      "duration_ms": 470,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 512,
+        "r_knee": 524,
+        "r_hip_pitch": 488,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 410,
+        "r_shoulder_roll": 375,
+        "r_elbow": 548,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 512,
+        "l_knee": 524,
+        "l_hip_pitch": 488,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 375,
+        "l_shoulder_roll": 625,
+        "l_elbow": 452
+      },
+      "note": "beat 4: fast_cross_right (grounded knee bounce)"
+    },
+    {
+      "duration_ms": 450,
+      "servos": {
+        "r_ankle_roll": 500,
+        "r_ankle_pitch": 508,
+        "r_knee": 516,
+        "r_hip_pitch": 492,
+        "r_hip_roll": 500,
+        "r_shoulder_pitch": 500,
+        "r_shoulder_roll": 500,
+        "r_elbow": 548,
+        "l_ankle_roll": 500,
+        "l_ankle_pitch": 508,
+        "l_knee": 516,
+        "l_hip_pitch": 492,
+        "l_hip_roll": 500,
+        "l_shoulder_pitch": 500,
+        "l_shoulder_roll": 500,
+        "l_elbow": 452
+      },
+      "note": "beat 5: finish_neutral"
+    }
+  ],
+  "kinematics": {
+    "verified": true,
+    "peak_torso_tilt_deg": 4.34,
+    "max_com_offset_norm": 0.145,
+    "joint_clipping_count": 0,
+    "max_slew_rate_pps": 574.5,
+    "lower_body_adapted": true,
+    "adaptation_notes": [
+      "Replaced sharp 22 deg lateral hip whipping (t=940ms) with a grounded rhythmic knee-bounce (knees 516..538 with counter-pitched hips and ankles, neutral rolls) to stay well within desktop bipedal CoM limits while exaggerating cross-body arm swings."
+    ],
+    "violations": [],
+    "sandbox_environment_id": "c0b161c2605c23c7071d945d3538d9f4"
+  },
+  "decision_gate": {
+    "is_physically_safe_prob": 0.9676541231587114,
+    "is_physically_safe_conf": 0.9676541231587114,
+    "needs_lower_body_adaptation_prob": 0.2043880206122534,
+    "needs_lower_body_adaptation_conf": 0.7956119793877466,
+    "move_fidelity_score": 2.482457450497523,
+    "move_fidelity_legend": {
+      "2": "2: Recognizable, rhythmically aligned adaptation preserving the main motion essence.",
+      "1": "1: Minimal resemblance; core rhythm, timing, or upper-body silhouette is mostly lost.",
+      "0": "0: Unrecognizable, broken/unsafe, or completely mismatched to the target motion.",
+      "3": "3: High-fidelity, beat-synced retargeting capturing the signature style and timing."
+    },
+    "move_fidelity_conf": 0.550202989939943,
+    "route": "execute_and_save",
+    "route_probabilities": {
+      "other": 0.005422984038749501,
+      "adapt_upper_body_only": 0.20203794378028112,
+      "execute_and_save": 0.7682816897461836,
+      "repair_in_forge": 0.01868548138528436,
+      "refuse_impossible": 0.005571901049501448
+    },
+    "route_conf": 0.7682816897461836,
+    "min_confidence": 0.7682816897461836,
+    "auto_branch_allowed": true,
+    "effective_action": "execute_and_save",
+    "raw_answers": {
+      "needs_lower_body_adaptation": {
+        "confidence": 0.7956119793877466,
+        "noul": 0.2043880206122534,
+        "type": "noul"
+      },
+      "move_fidelity": {
+        "confidence": 0.550202989939943,
+        "legend": {
+          "2": "2: Recognizable, rhythmically aligned adaptation preserving the main motion essence.",
+          "1": "1: Minimal resemblance; core rhythm, timing, or upper-body silhouette is mostly lost.",
+          "0": "0: Unrecognizable, broken/unsafe, or completely mismatched to the target motion.",
+          "3": "3: High-fidelity, beat-synced retargeting capturing the signature style and timing."
+        },
+        "probabilities": {
+          "2": 0.3878152764223598,
+          "0": 0.005763805804722985,
+          "1": 0.05621792783297423,
+          "3": 0.550202989939943
+        },
+        "score": 2.482457450497523,
+        "type": "score"
+      },
+      "is_physically_safe": {
+        "confidence": 0.9676541231587114,
+        "noul": 0.9676541231587114,
+        "type": "noul"
+      },
+      "route": {
+        "choice": "execute_and_save",
+        "confidence": 0.7682816897461836,
+        "probabilities": {
+          "other": 0.005422984038749501,
+          "adapt_upper_body_only": 0.20203794378028112,
+          "execute_and_save": 0.7682816897461836,
+          "repair_in_forge": 0.01868548138528436,
+          "refuse_impossible": 0.005571901049501448
+        },
+        "type": "choice"
+      }
+    }
+  },
+  "post_run_fidelity_score": 1.9601875624121856,
+  "artifact_sha256": "928b6a32ea4e618271acbf6ea49be10518d28dfc968cba1ad415cfa14037b075"
+}

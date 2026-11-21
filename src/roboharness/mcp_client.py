@@ -104,6 +104,27 @@ _SIMULATE_TOOL_CANDIDATES: tuple[str, ...] = (
 _SERVO_ID_RE = re.compile(r"^(?:servo[_-]?|id[_-]?)?(\d+)$", re.IGNORECASE)
 _POS_NUMERIC_KEY_RE = re.compile(r"""["']pos(?:itions)?["']\s*:\s*\{\s*["']\d+["']""")
 
+# Physical TonyPi bus-servo calibration map (IDs 1..8 left, 9..16 right) applied as
+# relative deltas around live `get_joints()` standing pulses on real `tonypi-mcp`.
+_PHYSICAL_TONYPI_SERVO_MAP: tuple[tuple[str, str, float], ...] = (
+    ("l_ankle_roll", "1", 0.25),
+    ("l_ankle_pitch", "2", -0.25),
+    ("l_knee", "3", -0.25),
+    ("l_hip_pitch", "4", 0.25),
+    ("l_hip_roll", "5", 0.25),
+    ("l_elbow", "6", 1.0),
+    ("l_shoulder_roll", "7", -0.85),
+    ("l_shoulder_pitch", "8", -1.25),
+    ("r_ankle_roll", "9", 0.25),
+    ("r_ankle_pitch", "10", 0.25),
+    ("r_knee", "11", 0.25),
+    ("r_hip_pitch", "12", -0.25),
+    ("r_hip_roll", "13", 0.25),
+    ("r_elbow", "14", -1.0),
+    ("r_shoulder_roll", "15", 0.85),
+    ("r_shoulder_pitch", "16", 1.25),
+)
+
 
 class MCPClientError(RuntimeError):
     """Raised when an MCP transport, protocol, or remote tool invocation fails."""
@@ -802,6 +823,28 @@ class TonypiMCPClient:
             return "action_group", save_tool, run_tool
         return None, None, None
 
+    def _read_physical_base_joints(self) -> dict[str, int]:
+        """Read live standing pulse calibration via `get_joints()` on real `tonypi-mcp`."""
+        result = self.call_tool("get_joints", {})
+        payload = _extract_tool_payload(result)
+        raw_map = (
+            payload.get("pos")
+            if isinstance(payload.get("pos"), dict)
+            else payload.get("raw")
+            if isinstance(payload.get("raw"), dict)
+            else payload
+        )
+        base_pos: dict[str, int] = {str(sid): 500 for sid in range(1, 17)}
+        if isinstance(raw_map, dict):
+            for raw_key, raw_val in raw_map.items():
+                key_s = str(raw_key).strip()
+                if key_s in base_pos:
+                    try:
+                        base_pos[key_s] = round(float(raw_val))
+                    except (TypeError, ValueError):
+                        continue
+        return base_pos
+
     def _build_batch_args(
         self,
         tool_def: dict[str, Any],
@@ -812,6 +855,31 @@ class TonypiMCPClient:
         props = schema.get("properties", {}) if isinstance(schema, dict) else {}
         tool_name_l = str(tool_def.get("name", "")).lower()
         is_play_frames = tool_name_l == "play_frames" or tool_name_l.endswith("_play_frames")
+
+        # Real physical tonypi-mcp exposes `get_joints`: project relative deltas onto live
+        # calibrated standing pulses and append a smooth return-to-stand settle frame.
+        if is_play_frames and "get_joints" in self._tools_by_name:
+            base_pos = self._read_physical_base_joints()
+            calibrated_frames: list[dict[str, Any]] = []
+            for kf in skill.keyframes:
+                scaled_ms = max(MIN_KEYFRAME_DURATION_MS, round(kf.duration_ms / speed_scale))
+                pos = dict(base_pos)
+                for joint_name, sid, sign_scale in _PHYSICAL_TONYPI_SERVO_MAP:
+                    if joint_name in kf.servos:
+                        pulse = kf.servos[joint_name]
+                        pos[sid] = max(
+                            140,
+                            min(860, round(base_pos[sid] + sign_scale * (pulse - 500))),
+                        )
+                calibrated_frames.append({"ms": scaled_ms, "pos": pos})
+            calibrated_frames.append({"ms": 500, "pos": dict(base_pos)})
+            return {
+                "frames": calibrated_frames,
+                "hold_s": 0.5,
+                "guard_tilt_deg": MAX_TORSO_TILT_DEG,
+                "wait": True,
+            }
+
         # Both real tonypi-mcp and MujocoTonypiMCPServer accept string servo IDs "1".."16" in play_frames.
         use_ids = is_play_frames or _schema_prefers_servo_ids(tool_def)
 
