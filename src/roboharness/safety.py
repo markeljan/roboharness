@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from typing import Iterable
+from collections.abc import Iterable
 
 from roboharness.config import (
     MAX_SERVO_TEMP_C,
@@ -157,18 +157,15 @@ def check_skill_keyframes(
                     f"frame[{idx}] {joint_name}={pulse} outside [{spec.min_pulse}, {spec.max_pulse}]"
                 )
             slew = abs(pulse - prev_pose[joint_name]) / dt_sec
-            if slew > max_slew:
-                max_slew = slew
+            max_slew = max(max_slew, slew)
             if slew > MAX_SLEW_PULSE_PER_SEC:
                 violations.append(
                     f"frame[{idx}] {joint_name} slew {slew:.1f} pps > {MAX_SLEW_PULSE_PER_SEC:.0f} pps"
                 )
 
         tilt_deg, com_norm = estimate_frame_tilt_and_com(merged_pose)
-        if tilt_deg > peak_tilt:
-            peak_tilt = tilt_deg
-        if com_norm > max_com:
-            max_com = com_norm
+        peak_tilt = max(peak_tilt, tilt_deg)
+        max_com = max(max_com, com_norm)
         if tilt_deg >= MAX_TORSO_TILT_DEG:
             violations.append(
                 f"frame[{idx}] estimated torso tilt {tilt_deg:.1f} deg >= {MAX_TORSO_TILT_DEG:.1f} deg"

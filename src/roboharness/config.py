@@ -38,6 +38,50 @@ RESERVED_AGENT_ID_PREFIXES: Final[tuple[str, ...]] = (
 )
 
 
+def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[7:].strip()
+    if "=" not in stripped:
+        return None
+    key, raw_value = stripped.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    elif " #" in value:
+        value = value.split(" #", 1)[0].rstrip()
+    return key, value
+
+
+def load_dotenv_if_present(env_path: Path | None = None) -> None:
+    """Load KEY=VALUE pairs from a local .env file without overriding existing env vars."""
+    candidates: list[Path]
+    if env_path is not None:
+        candidates = [Path(env_path)]
+    else:
+        cwd_env = Path.cwd() / ".env"
+        repo_env = Path(__file__).resolve().parents[2] / ".env"
+        candidates = [cwd_env] if cwd_env.resolve() == repo_env.resolve() else [cwd_env, repo_env]
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            parsed = _parse_dotenv_line(line)
+            if parsed is not None:
+                key, value = parsed
+                os.environ.setdefault(key, value)
+
+
 @dataclass(frozen=True)
 class RoboHarnessSettings:
     """Runtime settings loaded from environment variables with safe defaults."""
@@ -74,6 +118,7 @@ class RoboHarnessSettings:
     sse_port: int = 8770
 
     @classmethod
-    def from_env(cls) -> RoboHarnessSettings:
-        """Build settings freshly from current environment variables."""
+    def from_env(cls, env_path: Path | None = None) -> RoboHarnessSettings:
+        """Build settings freshly from current environment variables (auto-loading .env)."""
+        load_dotenv_if_present(env_path)
         return cls()

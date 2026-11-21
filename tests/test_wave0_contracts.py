@@ -1,11 +1,17 @@
 """Wave 0 contract and deterministic safety latch tests."""
 
+from pathlib import Path
+
+import pytest
+
 from roboharness.config import (
     API_VERSION,
     FORGE_AGENT_ID,
     REMOTE_MCP_NAME,
     RESERVED_AGENT_ID_PREFIXES,
     VALID_THINKING_LEVELS,
+    RoboHarnessSettings,
+    load_dotenv_if_present,
 )
 from roboharness.safety import (
     check_robot_telemetry,
@@ -78,3 +84,29 @@ def test_artifact_signing_and_tamper_detection() -> None:
 
     tampered = artifact.model_copy(update={"name": "tampered"})
     assert not verify_artifact_signature(tampered)
+
+
+def test_dotenv_loading_and_env_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# Comment line\n"
+        'GEMINI_API_KEY="from-dotenv-key"\n'
+        "export TONYPI_MCP_URL='http://10.0.0.5:8765/mcp'\n"
+        "ROBOHARNESS_WEBCAM_DEVICE=2 # inline comment\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("TONYPI_MCP_URL", "http://127.0.0.1:9999/mcp")
+    monkeypatch.delenv("ROBOHARNESS_WEBCAM_DEVICE", raising=False)
+
+    load_dotenv_if_present(env_file)
+    settings = RoboHarnessSettings.from_env(env_file)
+
+    assert settings.gemini_api_key == "from-dotenv-key"
+    assert settings.tonypi_mcp_url == "http://127.0.0.1:9999/mcp"
+    assert settings.webcam_device == "2"

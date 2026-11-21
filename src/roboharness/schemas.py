@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -219,7 +219,7 @@ class SkillArtifact(BaseModel):
 
     schema_version: str = "1.0"
     name: str
-    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     source_video: str = ""
     description: str = ""
     adaptation_mode: Literal["full_body", "upper_body_adapted"] = "full_body"
