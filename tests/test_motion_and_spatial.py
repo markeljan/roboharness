@@ -738,10 +738,16 @@ def test_compact_json_schema_for_gemini_strips_heavy_fsm_keywords() -> None:
             {"type": "text", "mime_type": "application/json", "schema": compact}
         )
 
-    # Local Pydantic validation still enforces strict numeric bounds on PoseSequence.
+    # Local Pydantic validation accepts wide observed human acrobatics (-360..360)
+    # while still enforcing strict numeric bounds on PoseSequence.
+    inverted_backflip = _sample_pose_sequence_dict()
+    inverted_backflip["keyframes"][0]["torso_pitch_deg"] = -165.0
+    parsed_backflip = PoseSequence.model_validate_json(json.dumps(inverted_backflip))
+    assert parsed_backflip.keyframes[0].torso_pitch_deg == -165.0
+
     out_of_range = _sample_pose_sequence_dict()
-    out_of_range["keyframes"][0]["torso_pitch_deg"] = 145.0
-    with pytest.raises(ValueError, match="less than or equal to 90"):
+    out_of_range["keyframes"][0]["torso_pitch_deg"] = 450.0
+    with pytest.raises(ValueError, match="less than or equal to 360"):
         PoseSequence.model_validate_json(json.dumps(out_of_range))
 
 

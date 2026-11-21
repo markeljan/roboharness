@@ -18,7 +18,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 from benchmarks.eval_5sigma import (
     SLIP_STRESS_MUJOCO_FRICTION,
+    BaselineScenarioResult,
     BenchmarkReport,
+    RoboHarnessScenarioResult,
+    ScenarioComparison,
+    _build_failure_ledger,
     main,
     render_proof_markdown,
     run_benchmark,
@@ -630,6 +634,158 @@ def test_live_mode_dual_client_routing_carbon_escalation_and_error_isolation(
     assert "Live Gemini 4 Dual-Client API" in md
     assert "`1/4`" in md
     assert "asym_flamingo_balance" in md
+
+
+def test_failure_ledger_distinguishes_post_run_low_conf_from_pre_escalation() -> None:
+    base_ok = BaselineScenarioResult(
+        scenario_id="gesture_greeting_wave",
+        mode="live",
+        status="executed_safe",
+        kinematics_verified=True,
+        physically_safe_pass=True,
+    )
+    comp_post_low = ScenarioComparison(
+        scenario_id="gesture_greeting_wave",
+        scenario_name="Greeting Wave",
+        category="gesture",
+        expect_physically_executable=True,
+        expect_lower_body_adaptation=False,
+        expect_refusal=False,
+        table_slip_multiplier=1.0,
+        slip_stress=False,
+        baseline=base_ok,
+        roboharness=RoboHarnessScenarioResult(
+            scenario_id="gesture_greeting_wave",
+            mode="live",
+            status="executed_safe",
+            route="execute_and_save",
+            adaptation_mode="full_body",
+            kinematics_verified=True,
+            observed_peak_tilt_deg=3.2,
+            servos_moved=True,
+            physically_safe_pass=True,
+            fidelity_score=2.4,
+            pre_fidelity_score=2.5,
+            post_fidelity_score=2.4,
+            decision_confidence=0.543,
+            min_confidence=0.543,
+        ),
+    )
+    comp_escalated = ScenarioComparison(
+        scenario_id="asym_flamingo_balance",
+        scenario_name="Flamingo Balance Pose",
+        category="asymmetric",
+        expect_physically_executable=True,
+        expect_lower_body_adaptation=True,
+        expect_refusal=False,
+        table_slip_multiplier=1.0,
+        slip_stress=False,
+        baseline=base_ok.model_copy(update={"scenario_id": "asym_flamingo_balance"}),
+        roboharness=RoboHarnessScenarioResult(
+            scenario_id="asym_flamingo_balance",
+            mode="live",
+            status="escalated_human",
+            route="escalate_human",
+            adaptation_mode="upper_body_adapted",
+            kinematics_verified=True,
+            servos_moved=False,
+            physically_safe_pass=True,
+            decision_confidence=0.68,
+            min_confidence=0.68,
+        ),
+    )
+
+    ledger = _build_failure_ledger([comp_post_low, comp_escalated], "live", "mujoco_mcp")
+    borderline = {
+        e.scenario_id: e for e in ledger if e.category == "borderline_confidence"
+    }
+
+    wave_entry = borderline["gesture_greeting_wave"]
+    assert "Executed safely; post-run Decisions API fidelity confidence was 0.54 < 0.75" in (
+        wave_entry.summary
+    )
+    assert "halted without moving servos" not in wave_entry.summary
+    assert "halted without moving servos" not in wave_entry.detail
+
+    flamingo_entry = borderline["asym_flamingo_balance"]
+    assert "halted without moving servos" in flamingo_entry.detail
+
+
+def test_parallel_workers_preserves_scenario_order_and_serializes_mcp(tmp_path: Path) -> None:
+    import threading
+
+    class _OverlapCheckingMCP(_StubRealMujocoMCP):
+        def __init__(self) -> None:
+            super().__init__()
+            self._busy = False
+            self._guard = threading.Lock()
+            self.overlap_detected = False
+
+        def _enter(self) -> None:
+            with self._guard:
+                if self._busy:
+                    self.overlap_detected = True
+                self._busy = True
+
+        def _exit(self) -> None:
+            with self._guard:
+                self._busy = False
+
+        def simulate_raw_frames(self, keyframes: list[Any], *, friction: float = 1.0) -> dict[str, Any]:
+            self._enter()
+            try:
+                time.sleep(0.005)
+                return super().simulate_raw_frames(keyframes, friction=friction)
+            finally:
+                self._exit()
+
+        def execute_skill(self, skill: SkillArtifact, **kwargs: Any) -> ExecutionTrace:
+            self._enter()
+            try:
+                time.sleep(0.005)
+                return super().execute_skill(skill, **kwargs)
+            finally:
+                self._exit()
+
+    with pytest.raises(ValueError, match="--workers"):
+        run_benchmark(mode="offline", workers=0, limit=1, quiet=True)
+
+    mcp = _OverlapCheckingMCP()
+    expected_ids = [s.id for s in SCENARIOS[:6]]
+    report = run_benchmark(
+        mode="offline",
+        scenario_ids=expected_ids,
+        workers=2,
+        real_mcp=True,
+        mcp_url="http://127.0.0.1:8765/mcp",
+        mcp_client=mcp,
+        quiet=True,
+    )
+    assert [c.scenario_id for c in report.comparisons] == expected_ids
+    assert mcp.overlap_detected is False
+
+    # Also exercise CLI --workers 2 flag end-to-end offline
+    md_out = tmp_path / "PARALLEL_PROOF.md"
+    json_out = tmp_path / "parallel.json"
+    code = main(
+        [
+            "--mode",
+            "offline",
+            "--mock-mcp",
+            "--workers",
+            "2",
+            "--limit",
+            "4",
+            "--output",
+            str(md_out),
+            "--json-out",
+            str(json_out),
+            "--quiet",
+        ]
+    )
+    assert code == 0
+    saved = BenchmarkReport.model_validate_json(json_out.read_text(encoding="utf-8"))
+    assert [c.scenario_id for c in saved.comparisons] == [s.id for s in SCENARIOS[:4]]
 
 
 def test_cli_script_invocation_offline_smoke(tmp_path: Path) -> None:

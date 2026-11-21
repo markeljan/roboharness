@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from roboharness.config import (
     API_VERSION,
@@ -30,6 +31,7 @@ from roboharness.safety import (
 from roboharness.schemas import (
     NEUTRAL_POSE,
     TONYPI_JOINTS,
+    HumanPoseKeyframe,
     RobotStatus,
     ServoKeyframe,
     SkillArtifact,
@@ -135,3 +137,44 @@ def test_dotenv_loading_and_env_precedence(
     assert settings.tonypi_mcp_url == "http://127.0.0.1:9999/mcp"
     assert settings.gemini_environment_id == "env_self_hosted_mujoco"
     assert settings.webcam_device == "2"
+
+
+def test_human_pose_keyframe_allows_inverted_backflip_angles() -> None:
+    inverted = HumanPoseKeyframe(
+        t_ms=420,
+        beat_index=2,
+        torso_pitch_deg=-165.0,
+        torso_roll_deg=180.0,
+        l_shoulder_pitch_deg=-210.0,
+        l_shoulder_roll_deg=190.0,
+        l_elbow_deg=165.0,
+        r_shoulder_pitch_deg=-210.0,
+        r_shoulder_roll_deg=-190.0,
+        r_elbow_deg=-165.0,
+        l_hip_pitch_deg=-140.0,
+        l_knee_deg=165.0,
+        r_hip_pitch_deg=-140.0,
+        r_knee_deg=-10.0,
+        foot_contact="airborne",
+        label="backflip_apex_inverted",
+    )
+    assert inverted.torso_pitch_deg == -165.0
+    assert inverted.foot_contact == "airborne"
+
+    with pytest.raises(ValidationError):
+        HumanPoseKeyframe(
+            t_ms=0,
+            beat_index=0,
+            torso_pitch_deg=999.0,
+            torso_roll_deg=0.0,
+            l_shoulder_pitch_deg=0.0,
+            l_shoulder_roll_deg=0.0,
+            l_elbow_deg=0.0,
+            r_shoulder_pitch_deg=0.0,
+            r_shoulder_roll_deg=0.0,
+            r_elbow_deg=0.0,
+            l_hip_pitch_deg=0.0,
+            l_knee_deg=0.0,
+            r_hip_pitch_deg=0.0,
+            r_knee_deg=0.0,
+        )

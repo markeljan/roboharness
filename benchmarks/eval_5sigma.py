@@ -24,12 +24,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import inspect
 import json
 import math
 import sys
+import threading
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -369,61 +372,68 @@ def _simulate_baseline_on_real_mcp(
     artifact: SkillArtifact,
     *,
     friction: float,
+    mcp_lock: threading.Lock | None = None,
 ) -> tuple[float, bool, bool, int | None, str | None, RobotStatus, str | None]:
     """Simulate raw Baseline A keyframes in real MuJoCo MCP (recording real tilt, fall, frame)."""
-    _try_reset_sim(mcp, friction=friction)
-    sim_fn = getattr(mcp, "simulate_raw_frames", None)
-    sim_payload = sim_fn(artifact.keyframes, friction=friction) if callable(sim_fn) else None
+    lock_ctx = mcp_lock if mcp_lock is not None else contextlib.nullcontext()
+    with lock_ctx:
+        _try_reset_sim(mcp, friction=friction)
+        sim_fn = getattr(mcp, "simulate_raw_frames", None)
+        sim_payload = sim_fn(artifact.keyframes, friction=friction) if callable(sim_fn) else None
 
-    if isinstance(sim_payload, dict):
-        peak_tilt = round(
-            float(
-                sim_payload.get("peak_tilt_deg")
-                or sim_payload.get("max_tilt_deg")
-                or sim_payload.get("end_tilt_deg")
-                or 0.0
-            ),
-            2,
-        )
-        fell = bool(sim_payload.get("fell", False))
-        contacts = _extract_contacts(sim_payload)
-        aborted = bool(sim_payload.get("aborted", False)) or fell or peak_tilt >= MAX_TORSO_TILT_DEG
-        abort_reason = sim_payload.get("abort_reason")
-        if fell and not abort_reason:
-            abort_reason = f"Real MuJoCo fall detected (peak_tilt={peak_tilt:.1f} deg)"
-        frame_b64 = sim_payload.get("frame_b64")
-        if not isinstance(frame_b64, str) or not frame_b64:
+        if isinstance(sim_payload, dict):
+            peak_tilt = round(
+                float(
+                    sim_payload.get("peak_tilt_deg")
+                    or sim_payload.get("max_tilt_deg")
+                    or sim_payload.get("end_tilt_deg")
+                    or 0.0
+                ),
+                2,
+            )
+            fell = bool(sim_payload.get("fell", False))
+            contacts = _extract_contacts(sim_payload)
+            aborted = (
+                bool(sim_payload.get("aborted", False))
+                or fell
+                or peak_tilt >= MAX_TORSO_TILT_DEG
+            )
+            abort_reason = sim_payload.get("abort_reason")
+            if fell and not abort_reason:
+                abort_reason = f"Real MuJoCo fall detected (peak_tilt={peak_tilt:.1f} deg)"
+            frame_b64 = sim_payload.get("frame_b64")
+            if not isinstance(frame_b64, str) or not frame_b64:
+                frame_bytes = _try_perceive_bytes(mcp)
+                frame_b64 = base64.b64encode(frame_bytes).decode("ascii") if frame_bytes else None
+            final_status = mcp.get_status()
+            return (
+                peak_tilt,
+                aborted,
+                fell,
+                contacts,
+                str(abort_reason) if abort_reason else None,
+                final_status,
+                frame_b64,
+            )
+
+        # Fallback when connected to a real hardware MCP server without `simulate_motion`
+        trace = mcp.execute_skill(artifact)
+        final_status = trace.final_status
+        peak_tilt = trace.peak_observed_tilt_deg
+        fell = (not final_status.standing) or peak_tilt >= MAX_TORSO_TILT_DEG
+        frame_b64 = trace.post_run_frame_b64
+        if not frame_b64:
             frame_bytes = _try_perceive_bytes(mcp)
             frame_b64 = base64.b64encode(frame_bytes).decode("ascii") if frame_bytes else None
-        final_status = mcp.get_status()
         return (
             peak_tilt,
-            aborted,
+            trace.aborted or fell or peak_tilt >= MAX_TORSO_TILT_DEG,
             fell,
-            contacts,
-            str(abort_reason) if abort_reason else None,
+            _extract_contacts(final_status.raw),
+            trace.abort_reason,
             final_status,
             frame_b64,
         )
-
-    # Fallback when connected to a real hardware MCP server without `simulate_motion`
-    trace = mcp.execute_skill(artifact)
-    final_status = trace.final_status
-    peak_tilt = trace.peak_observed_tilt_deg
-    fell = (not final_status.standing) or peak_tilt >= MAX_TORSO_TILT_DEG
-    frame_b64 = trace.post_run_frame_b64
-    if not frame_b64:
-        frame_bytes = _try_perceive_bytes(mcp)
-        frame_b64 = base64.b64encode(frame_bytes).decode("ascii") if frame_bytes else None
-    return (
-        peak_tilt,
-        trace.aborted or fell or peak_tilt >= MAX_TORSO_TILT_DEG,
-        fell,
-        _extract_contacts(final_status.raw),
-        trace.abort_reason,
-        final_status,
-        frame_b64,
-    )
 
 
 def _estimate_offline_fidelity(
@@ -482,6 +492,7 @@ def _run_baseline_offline(
     scenario: MotionScenario,
     *,
     real_mcp: Any | None = None,
+    mcp_lock: threading.Lock | None = None,
     hub: TelemetryHub | None = None,
 ) -> BaselineScenarioResult:
     t0 = time.perf_counter()
@@ -518,6 +529,7 @@ def _run_baseline_offline(
             real_mcp,
             artifact,
             friction=_scenario_friction(scenario),
+            mcp_lock=mcp_lock,
         )
     else:
         (
@@ -595,6 +607,7 @@ def _run_baseline_live(
     scenario: MotionScenario,
     *,
     real_mcp: Any | None = None,
+    mcp_lock: threading.Lock | None = None,
     hub: TelemetryHub | None = None,
 ) -> BaselineScenarioResult:
     """Run Baseline A on live v1 client (gemini-4-hydrogen) + v1beta Decisions API rubric."""
@@ -633,6 +646,7 @@ def _run_baseline_live(
                 real_mcp,
                 artifact,
                 friction=_scenario_friction(scenario),
+                mcp_lock=mcp_lock,
             )
             eval_frames = [base64.b64decode(frame_b64)] if frame_b64 else []
             # v1beta client for gemini-decision-1 scoring on real rendered MuJoCo frame
@@ -745,6 +759,7 @@ def _run_roboharness_offline(
     scenario: MotionScenario,
     *,
     real_mcp: Any | None = None,
+    mcp_lock: threading.Lock | None = None,
     hub: TelemetryHub | None = None,
 ) -> RoboHarnessScenarioResult:
     t0 = time.perf_counter()
@@ -851,8 +866,10 @@ def _run_roboharness_offline(
         )
 
     if real_mcp is not None:
-        _try_reset_sim(real_mcp, friction=_scenario_friction(scenario))
-        trace = real_mcp.execute_skill(artifact)
+        lock_ctx = mcp_lock if mcp_lock is not None else contextlib.nullcontext()
+        with lock_ctx:
+            _try_reset_sim(real_mcp, friction=_scenario_friction(scenario))
+            trace = real_mcp.execute_skill(artifact)
     else:
         server = MockTonypiMCPServer(
             mode="batch", table_slip_multiplier=scenario.table_slip_multiplier
@@ -951,6 +968,7 @@ def _run_roboharness_live(
     *,
     deep: bool = False,
     real_mcp: Any | None = None,
+    mcp_lock: threading.Lock | None = None,
     hub: TelemetryHub | None = None,
 ) -> RoboHarnessScenarioResult:
     """Run Full RoboHarness with Dual Clients (v1 Interactions + v1beta Forge & Decisions)."""
@@ -1034,10 +1052,16 @@ def _run_roboharness_live(
 
         def _execute_gated_on_mcp(mcp: Any) -> RoboHarnessScenarioResult:
             nonlocal artifact, forge_attempts, model_used, escalated_to_carbon
-            if real_mcp is not None:
-                _try_reset_sim(mcp, friction=_scenario_friction(scenario))
-            pre_status = mcp.get_status()
-            ref_jpeg = _try_perceive_bytes(mcp)
+            lock_ctx = (
+                mcp_lock
+                if (real_mcp is not None and mcp_lock is not None)
+                else contextlib.nullcontext()
+            )
+            with lock_ctx:
+                if real_mcp is not None:
+                    _try_reset_sim(mcp, friction=_scenario_friction(scenario))
+                pre_status = mcp.get_status()
+                ref_jpeg = _try_perceive_bytes(mcp)
             ref_frames = [ref_jpeg] if ref_jpeg else []
             if ref_jpeg:
                 _emit_ui_frame(
@@ -1253,13 +1277,18 @@ def _run_roboharness_live(
                 )
 
             # 5. Execute on live MuJoCo MCP (`play_frames` with guard_tilt_deg=30) or Mock MCP
-            trace = mcp.execute_skill(artifact)
-            post_b64 = trace.post_run_frame_b64
-            if not post_b64:
-                fallback_bytes = _try_perceive_bytes(mcp)
-                post_b64 = (
-                    base64.b64encode(fallback_bytes).decode("ascii") if fallback_bytes else None
-                )
+            with lock_ctx:
+                if real_mcp is not None:
+                    _try_reset_sim(mcp, friction=_scenario_friction(scenario))
+                trace = mcp.execute_skill(artifact)
+                post_b64 = trace.post_run_frame_b64
+                if not post_b64:
+                    fallback_bytes = _try_perceive_bytes(mcp)
+                    post_b64 = (
+                        base64.b64encode(fallback_bytes).decode("ascii")
+                        if fallback_bytes
+                        else None
+                    )
             post_jpeg = base64.b64decode(post_b64) if post_b64 else None
             fell = not trace.final_status.standing
             contacts = _extract_contacts(trace.final_status.raw)
@@ -1615,25 +1644,56 @@ def _build_failure_ledger(
     # 3. Borderline Confidence & Safety Probability Escalations (< 0.75)
     borderline_found = False
     for c in comparisons:
-        min_conf = c.roboharness.min_confidence
-        if c.roboharness.status == "escalated_human" or (
-            min_conf is not None and min_conf < DECISION_CONFIDENCE_THRESHOLD
-        ):
+        rh = c.roboharness
+        min_conf = rh.min_confidence
+        is_pre_escalated = rh.status == "escalated_human" or (
+            not rh.servos_moved
+            and min_conf is not None
+            and min_conf < DECISION_CONFIDENCE_THRESHOLD
+        )
+        is_post_low_conf = (
+            rh.servos_moved
+            and min_conf is not None
+            and min_conf < DECISION_CONFIDENCE_THRESHOLD
+        )
+
+        if is_pre_escalated:
             borderline_found = True
+            conf_str = f"{min_conf:.2f}" if min_conf is not None else "n/a"
             ledger.append(
                 FailureLedgerEntry(
                     category="borderline_confidence",
                     scenario_id=c.scenario_id,
                     system="roboharness",
                     summary=(
-                        f"Borderline confidence ({min_conf if min_conf is not None else 'n/a'}) "
+                        f"Borderline confidence ({conf_str}) "
                         f"< {DECISION_CONFIDENCE_THRESHOLD:.2f} triggered safe escalation"
                     ),
                     detail=(
                         "RoboHarness halted without moving servos (effective_action="
-                        f"{c.roboharness.route}) per the >= {DECISION_CONFIDENCE_THRESHOLD:.2f} "
+                        f"{rh.route}) per the >= {DECISION_CONFIDENCE_THRESHOLD:.2f} "
                         f"confidence & >= {DECISION_SAFETY_PROB_THRESHOLD:.2f} safety-probability "
                         "Decisions API gate."
+                    ),
+                )
+            )
+        elif is_post_low_conf:
+            borderline_found = True
+            assert min_conf is not None
+            ledger.append(
+                FailureLedgerEntry(
+                    category="borderline_confidence",
+                    scenario_id=c.scenario_id,
+                    system="roboharness",
+                    summary=(
+                        f"Executed safely; post-run Decisions API fidelity confidence was "
+                        f"{min_conf:.2f} < {DECISION_CONFIDENCE_THRESHOLD:.2f}"
+                    ),
+                    detail=(
+                        f"Pre-execution gate passed (>= {DECISION_CONFIDENCE_THRESHOLD:.2f}) and "
+                        f"skill executed (status={rh.status}, route={rh.route}, "
+                        f"tilt={rh.observed_peak_tilt_deg:.1f} deg); post-run Decisions API "
+                        "scoring uncertainty is logged honestly without fabricating confidence."
                     ),
                 )
             )
@@ -1732,6 +1792,7 @@ def run_benchmark(
     scenario_ids: Sequence[str] | None = None,
     limit: int | None = None,
     deep: bool = False,
+    workers: int = 1,
     real_mcp: bool = False,
     mcp_url: str | None = None,
     mcp_client: Any | None = None,
@@ -1745,7 +1806,12 @@ def run_benchmark(
     In ``--mode live``, strictly requires ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY`` (or injected
     ``clients: DualGenAIClients`` for unit tests) and NEVER falls back to offline synthetic data.
     When ``real_mcp=True``, connects to the live MuJoCo / TonyPi Streamable HTTP MCP server.
+    When ``workers > 1``, executes scenarios concurrently across cloud calls while serializing
+    local MCP physics operations under a shared lock and preserving deterministic scenario order.
     """
+    if workers < 1:
+        raise ValueError(f"--workers must be >= 1, got {workers}")
+
     selected = select_scenarios(scenario_ids=scenario_ids, limit=limit)
     resolved_settings = settings or RoboHarnessSettings.from_env()
     physics_backend: PhysicsBackend = "mujoco_mcp" if real_mcp else "mock_mcp"
@@ -1789,51 +1855,70 @@ def run_benchmark(
         if not quiet:
             print(f"[5-sigma] Connected real MCP physics backend: {resolved_mcp_url}", flush=True)
 
-    comparisons: list[ScenarioComparison] = []
     total = len(selected)
-    try:
-        for idx, scenario in enumerate(selected, start=1):
-            if not quiet:
-                stress_label = (
-                    f"friction={_scenario_friction(scenario):.2f}"
-                    if real_mcp
-                    else f"slip={scenario.table_slip_multiplier:.2f}x"
-                )
+    mcp_lock = threading.Lock()
+    print_lock = threading.Lock()
+    thread_local = threading.local()
+
+    def _get_worker_clients() -> DualGenAIClients:
+        if clients is not None:
+            return clients
+        if workers == 1:
+            assert live_clients is not None
+            return live_clients
+        cached = getattr(thread_local, "dual_clients", None)
+        if cached is None:
+            cached = make_dual_clients(resolved_settings.gemini_api_key)
+            thread_local.dual_clients = cached
+        return cached
+
+    def _run_one(item: tuple[int, MotionScenario]) -> tuple[int, ScenarioComparison]:
+        idx, scenario = item
+        if not quiet:
+            stress_label = (
+                f"friction={_scenario_friction(scenario):.2f}"
+                if real_mcp
+                else f"slip={scenario.table_slip_multiplier:.2f}x"
+            )
+            with print_lock:
                 print(
-                    f"[5-sigma] ({idx}/{total}) {scenario.id} "
+                    f"[5-sigma] ({idx + 1}/{total}) {scenario.id} "
                     f"[{scenario.category}, {stress_label}, {physics_backend}] ...",
                     flush=True,
                 )
 
-            if mode == "offline":
-                baseline_res = _run_baseline_offline(
-                    scenario, real_mcp=active_real_mcp, hub=hub
-                )
-                robo_res = _run_roboharness_offline(
-                    scenario, real_mcp=active_real_mcp, hub=hub
-                )
-            else:
-                assert live_clients is not None
-                baseline_res = _run_baseline_live(
-                    live_clients,
-                    resolved_settings,
-                    scenario,
-                    real_mcp=active_real_mcp,
-                    hub=hub,
-                )
-                robo_res = _run_roboharness_live(
-                    live_clients,
-                    resolved_settings,
-                    scenario,
-                    deep=deep,
-                    real_mcp=active_real_mcp,
-                    hub=hub,
-                )
+        if mode == "offline":
+            baseline_res = _run_baseline_offline(
+                scenario, real_mcp=active_real_mcp, mcp_lock=mcp_lock, hub=hub
+            )
+            robo_res = _run_roboharness_offline(
+                scenario, real_mcp=active_real_mcp, mcp_lock=mcp_lock, hub=hub
+            )
+        else:
+            worker_clients = _get_worker_clients()
+            baseline_res = _run_baseline_live(
+                worker_clients,
+                resolved_settings,
+                scenario,
+                real_mcp=active_real_mcp,
+                mcp_lock=mcp_lock,
+                hub=hub,
+            )
+            robo_res = _run_roboharness_live(
+                worker_clients,
+                resolved_settings,
+                scenario,
+                deep=deep,
+                real_mcp=active_real_mcp,
+                mcp_lock=mcp_lock,
+                hub=hub,
+            )
 
-            if not quiet:
-                carbon_tag = " [carbon]" if robo_res.escalated_to_carbon else ""
+        if not quiet:
+            carbon_tag = " [carbon]" if robo_res.escalated_to_carbon else ""
+            with print_lock:
                 print(
-                    f"          Baseline A: {baseline_res.status} "
+                    f"          [{scenario.id}] Baseline A: {baseline_res.status} "
                     f"(tilt={baseline_res.observed_peak_tilt_deg:.1f}deg, "
                     f"clip={baseline_res.joint_clipping_count}, "
                     f"fell={baseline_res.fell}, t={baseline_res.latency_s:.2f}s) | "
@@ -1844,23 +1929,46 @@ def run_benchmark(
                     flush=True,
                 )
 
-            comparisons.append(
-                ScenarioComparison(
-                    scenario_id=scenario.id,
-                    scenario_name=scenario.name,
-                    category=scenario.category,
-                    expect_physically_executable=scenario.expect_physically_executable,
-                    expect_lower_body_adaptation=scenario.expect_lower_body_adaptation,
-                    expect_refusal=scenario.expect_refusal,
-                    table_slip_multiplier=scenario.table_slip_multiplier,
-                    slip_stress=scenario.slip_stress,
-                    baseline=baseline_res,
-                    roboharness=robo_res,
-                )
-            )
+        return (
+            idx,
+            ScenarioComparison(
+                scenario_id=scenario.id,
+                scenario_name=scenario.name,
+                category=scenario.category,
+                expect_physically_executable=scenario.expect_physically_executable,
+                expect_lower_body_adaptation=scenario.expect_lower_body_adaptation,
+                expect_refusal=scenario.expect_refusal,
+                table_slip_multiplier=scenario.table_slip_multiplier,
+                slip_stress=scenario.slip_stress,
+                baseline=baseline_res,
+                roboharness=robo_res,
+            ),
+        )
+
+    results_by_idx: dict[int, ScenarioComparison] = {}
+    indexed_scenarios = list(enumerate(selected))
+    try:
+        if workers == 1 or total <= 1:
+            for item in indexed_scenarios:
+                idx, comp = _run_one(item)
+                results_by_idx[idx] = comp
+        else:
+            max_w = min(workers, total)
+            if not quiet:
+                with print_lock:
+                    print(
+                        f"[5-sigma] Running {total} scenarios across {max_w} parallel workers "
+                        f"(shared MCP physics lock)...",
+                        flush=True,
+                    )
+            with ThreadPoolExecutor(max_workers=max_w) as pool:
+                for idx, comp in pool.map(_run_one, indexed_scenarios):
+                    results_by_idx[idx] = comp
     finally:
         if owns_mcp and active_real_mcp is not None:
             active_real_mcp.close()
+
+    comparisons = [results_by_idx[i] for i in range(total)]
 
     baseline_metrics, robo_metrics = _compute_metrics(comparisons)
     ledger = _build_failure_ledger(comparisons, mode, physics_backend)
@@ -2211,6 +2319,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Optional comma-separated scenario IDs to run (e.g. dance_floss,imp_standing_backflip).",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of concurrent scenario worker threads (default: 1; e.g. 4 for parallel cloud).",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress per-scenario stdout progress lines.",
@@ -2251,6 +2365,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scenario_ids=scenario_ids,
             limit=args.limit,
             deep=args.deep,
+            workers=args.workers,
             real_mcp=args.real_mcp,
             mcp_url=resolved_mcp_url,
             hub=hub,
