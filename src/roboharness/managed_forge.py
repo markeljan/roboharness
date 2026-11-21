@@ -1,10 +1,15 @@
-"""Google Managed Agent Skill Forge (antigravity-preview-09-2026 + gemini-4-neon).
+"""Google Managed Agent Skill Forge (antigravity-preview-09-2026 + Neon / Carbon).
 
-Stages `.agents/AGENTS.md`, `.agents/skills/kinematics-verifier/SKILL.md`, and
-`/workspace/kinematics_verify.py` into a forked remote sandbox environment,
-creates/reuses the custom Managed Agent `roboharness-skill-forge`, parses its
-retargeted 16-DOF TonyPi skill output, runs deterministic local defense-in-depth
-verification, and signs the resulting `SkillArtifact` with SHA-256.
+Runs on the ``v1beta`` client (`beta_client`). Supports:
+- Hosted remote sandbox (`environment="remote"`) with forked pre-staged
+  `.agents/AGENTS.md`, `.agents/skills/kinematics-verifier/SKILL.md`, and
+  `/workspace/kinematics_verify.py`.
+- Optional Docker-isolated self-hosted MuJoCo environment (`GEMINI_ENVIRONMENT_ID`),
+  passing `environment=settings.gemini_environment_id` and omitting hosted-only
+  inline `sources` and network egress allowlists.
+- Automatic escalation from `gemini-4-neon` (`roboharness-skill-forge`) to
+  `gemini-4-carbon` (`roboharness-skill-forge-carbon`) after 2 failed local
+  kinematics verifications, or direct Carbon routing via `deep=True`.
 """
 
 from __future__ import annotations
@@ -14,12 +19,13 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from roboharness.config import (
+    FORGE_MODEL,
     MAX_SLEW_PULSE_PER_SEC,
     MIN_KEYFRAME_DURATION_MS,
     REMOTE_MCP_NAME,
@@ -66,7 +72,7 @@ FORGE_SYSTEM_INSTRUCTION: str = (
 
 @dataclass(frozen=True)
 class ForgeAgentState:
-    """Resolved state for the persisted custom Managed Agent."""
+    """Resolved state for a persisted custom Managed Agent."""
 
     agent_id: str
     base_environment_id: str | None
@@ -84,6 +90,8 @@ class ForgeResult:
     environment_id: str | None
     interaction_id: str | None
     raw_output: str
+    model_used: str = FORGE_MODEL
+    escalated_to_carbon: bool = False
 
 
 def validate_agent_id(agent_id: str) -> str:
@@ -107,6 +115,19 @@ def validate_mcp_tool_name(name: str) -> str:
             f"Remote MCP tool name '{name}' violates required pattern '^[a-z0-9_-]+$'."
         )
     return name
+
+
+def resolve_forge_target(settings: RoboHarnessSettings, *, deep: bool = False) -> tuple[str, str]:
+    """Resolve (agent_id, model_name) for Neon default vs Carbon deep mode."""
+    if deep:
+        return validate_agent_id(settings.forge_deep_agent_id), settings.forge_deep_model
+    return validate_agent_id(settings.managed_agent_id), settings.forge_model
+
+
+def resolve_forge_environment(settings: RoboHarnessSettings) -> str:
+    """Return GEMINI_ENVIRONMENT_ID if configured, otherwise hosted 'remote'."""
+    env_id = (settings.gemini_environment_id or "").strip()
+    return env_id if env_id else "remote"
 
 
 def load_bundle_inline_sources(bundle_dir: Path | None = None) -> list[dict[str, str]]:
@@ -168,7 +189,6 @@ def _extract_interaction_text(interaction: Any) -> str:
     if isinstance(output_text, str) and output_text.strip():
         return output_text
 
-    # Fallback: check steps (ModelOutputStep.content) or outputs list
     steps = _get_field(interaction, "steps")
     if isinstance(steps, list):
         chunks: list[str] = []
@@ -197,7 +217,7 @@ def _extract_interaction_text(interaction: Any) -> str:
 
 
 def _wait_for_interaction(
-    client: Any,
+    beta_client: Any,
     interaction: Any,
     *,
     poll_interval_sec: float = 1.0,
@@ -221,7 +241,7 @@ def _wait_for_interaction(
             )
         if poll_interval_sec > 0:
             time.sleep(poll_interval_sec)
-        current = client.interactions.get(id=interaction_id)
+        current = beta_client.interactions.get(id=interaction_id)
         status = _get_field(current, "status")
         if status in _TERMINAL_STATUSES:
             break
@@ -239,12 +259,23 @@ def _read_saved_state(state_path: Path) -> dict[str, Any]:
 
 
 def _write_saved_state(state_path: Path, state: ForgeAgentState, base_agent: str) -> None:
+    existing = _read_saved_state(state_path)
+    agents_map = existing.get("agents") if isinstance(existing.get("agents"), dict) else {}
+    now_iso = datetime.now(UTC).isoformat()
+    agents_map[state.agent_id] = {
+        "agent_id": state.agent_id,
+        "base_agent": base_agent,
+        "model": state.model,
+        "base_environment_id": state.base_environment_id,
+        "updated_at": now_iso,
+    }
     payload = {
         "agent_id": state.agent_id,
         "base_agent": base_agent,
         "model": state.model,
         "base_environment_id": state.base_environment_id,
-        "updated_at": datetime.now(UTC).isoformat(),
+        "updated_at": now_iso,
+        "agents": agents_map,
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
@@ -253,25 +284,27 @@ def _write_saved_state(state_path: Path, state: ForgeAgentState, base_agent: str
 
 
 def ensure_forge_agent(
-    client: Any,
+    beta_client: Any,
     settings: RoboHarnessSettings,
     *,
     force_recreate: bool = False,
+    deep: bool = False,
     poll_interval_sec: float = 1.0,
     bundle_dir: Path | None = None,
 ) -> ForgeAgentState:
-    """Ensure the custom Managed Agent exists with a pre-staged sandbox environment."""
-    agent_id = validate_agent_id(settings.managed_agent_id)
+    """Ensure the Neon or Carbon custom Managed Agent exists on the v1beta client."""
+    agent_id, target_model = resolve_forge_target(settings, deep=deep)
+    custom_env_id = (settings.gemini_environment_id or "").strip() or None
 
     if not force_recreate:
         try:
-            existing = client.agents.get(id=agent_id)
+            existing = beta_client.agents.get(id=agent_id)
         except Exception:  # noqa: BLE001
             existing = None
 
         if existing is not None:
             raw_base_env = _get_field(existing, "base_environment")
-            base_env_id: str | None = None
+            base_env_id: str | None = custom_env_id
             if isinstance(raw_base_env, str) and raw_base_env:
                 base_env_id = raw_base_env
             elif raw_base_env is not None:
@@ -280,13 +313,15 @@ def ensure_forge_agent(
                     base_env_id = maybe_env_id
             if base_env_id is None:
                 saved = _read_saved_state(settings.forge_state_path)
-                if saved.get("agent_id") == agent_id and isinstance(
-                    saved.get("base_environment_id"), str
+                saved_agents = saved.get("agents") if isinstance(saved.get("agents"), dict) else {}
+                entry = saved_agents.get(agent_id) if isinstance(saved_agents.get(agent_id), dict) else saved
+                if entry.get("agent_id") == agent_id and isinstance(
+                    entry.get("base_environment_id"), str
                 ):
-                    base_env_id = saved["base_environment_id"]
+                    base_env_id = entry["base_environment_id"]
 
             raw_cfg = _get_field(existing, "agent_config")
-            resolved_model = _get_field(raw_cfg, "model") or settings.forge_model
+            resolved_model = _get_field(raw_cfg, "model") or target_model
             state = ForgeAgentState(
                 agent_id=agent_id,
                 base_environment_id=base_env_id,
@@ -297,49 +332,57 @@ def ensure_forge_agent(
             return state
     else:
         try:
-            client.agents.delete(id=agent_id)
+            beta_client.agents.delete(id=agent_id)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Ignoring delete failure while recreating agent '%s': %s", agent_id, exc)
 
-    sources = load_bundle_inline_sources(bundle_dir)
-    base_environment: str | dict[str, Any] = {"type": "remote", "sources": sources}
-    base_environment_id: str | None = None
+    if custom_env_id is not None:
+        # Self-hosted Docker/MuJoCo environment: pass environment ID directly and
+        # strictly omit hosted-only inline `sources` and egress allowlists.
+        base_environment: str | dict[str, Any] = custom_env_id
+        base_environment_id: str | None = custom_env_id
+    else:
+        sources = load_bundle_inline_sources(bundle_dir)
+        base_environment = {"type": "remote", "sources": sources}
+        base_environment_id = None
 
-    try:
-        bootstrap = client.interactions.create(
-            agent=settings.base_agent,
-            input=(
-                "Run `python3 /workspace/kinematics_verify.py --self-test` to verify "
-                "the pre-staged TonyPi kinematics verifier and reply with the JSON output."
-            ),
-            environment={"type": "remote", "sources": sources},
-        )
-        bootstrap = _wait_for_interaction(client, bootstrap, poll_interval_sec=poll_interval_sec)
-        bootstrap_status = _get_field(bootstrap, "status")
-        env_id = _get_field(bootstrap, "environment_id")
-        if (
-            isinstance(env_id, str)
-            and env_id.strip()
-            and bootstrap_status not in {"failed", "cancelled"}
-        ):
-            base_environment = env_id.strip()
-            base_environment_id = env_id.strip()
-        else:
-            logger.warning(
-                "Bootstrap interaction returned no usable environment_id (status=%s); "
-                "falling back to inline base_environment.",
-                bootstrap_status,
+        try:
+            bootstrap = beta_client.interactions.create(
+                agent=settings.base_agent,
+                input=(
+                    "Run `python3 /workspace/kinematics_verify.py --self-test` to verify "
+                    "the pre-staged TonyPi kinematics verifier and reply with the JSON output."
+                ),
+                environment={"type": "remote", "sources": sources},
             )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Bootstrap environment fork failed (%s); falling back to inline base_environment.",
-            exc,
-        )
+            bootstrap = _wait_for_interaction(
+                beta_client, bootstrap, poll_interval_sec=poll_interval_sec
+            )
+            bootstrap_status = _get_field(bootstrap, "status")
+            env_id = _get_field(bootstrap, "environment_id")
+            if (
+                isinstance(env_id, str)
+                and env_id.strip()
+                and bootstrap_status not in {"failed", "cancelled"}
+            ):
+                base_environment = env_id.strip()
+                base_environment_id = env_id.strip()
+            else:
+                logger.warning(
+                    "Bootstrap interaction returned no usable environment_id (status=%s); "
+                    "falling back to inline base_environment.",
+                    bootstrap_status,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Bootstrap environment fork failed (%s); falling back to inline base_environment.",
+                exc,
+            )
 
-    client.agents.create(
+    beta_client.agents.create(
         id=agent_id,
         base_agent=settings.base_agent,
-        agent_config={"type": "antigravity", "model": settings.forge_model},
+        agent_config={"type": "antigravity", "model": target_model},
         system_instruction=FORGE_SYSTEM_INSTRUCTION,
         base_environment=base_environment,
     )
@@ -347,7 +390,7 @@ def ensure_forge_agent(
     state = ForgeAgentState(
         agent_id=agent_id,
         base_environment_id=base_environment_id,
-        model=settings.forge_model,
+        model=target_model,
         created_now=True,
     )
     _write_saved_state(settings.forge_state_path, state, settings.base_agent)
@@ -360,7 +403,6 @@ def extract_json_object(raw_text: str) -> dict[str, Any]:
     if not text:
         raise ValueError("Forge returned empty output; expected ForgeResponse JSON.")
 
-    # 1. Direct JSON parse
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
@@ -368,7 +410,6 @@ def extract_json_object(raw_text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    # 2. Markdown code fences (prefer last valid JSON object block)
     fence_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
     for block in reversed(fence_matches):
         try:
@@ -378,7 +419,6 @@ def extract_json_object(raw_text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
 
-    # 3. Scan for balanced JSON objects via JSONDecoder.raw_decode
     decoder = json.JSONDecoder()
     candidates: list[dict[str, Any]] = []
     idx = 0
@@ -489,7 +529,7 @@ def _repair_keyframes_locally(
 
 
 def forge_skill(
-    client: Any,
+    beta_client: Any,
     settings: RoboHarnessSettings,
     pose_seq: PoseSequence,
     skill_name: str,
@@ -498,14 +538,15 @@ def forge_skill(
     adaptation_hint: str | None = None,
     repair_feedback: str | None = None,
     use_remote_mcp: bool = False,
+    deep: bool = False,
     auto_repair_locally: bool = False,
     ensure_agent: bool = True,
     poll_interval_sec: float = 1.0,
 ) -> ForgeResult:
-    """Invoke the custom Managed Agent Skill Forge and verify/sign the returned skill."""
-    agent_id = validate_agent_id(settings.managed_agent_id)
-    if ensure_agent and hasattr(client, "agents"):
-        ensure_forge_agent(client, settings, poll_interval_sec=poll_interval_sec)
+    """Invoke the custom Managed Agent Skill Forge on v1beta and verify/sign the skill."""
+    agent_id, target_model = resolve_forge_target(settings, deep=deep)
+    if ensure_agent and hasattr(beta_client, "agents"):
+        ensure_forge_agent(beta_client, settings, deep=deep, poll_interval_sec=poll_interval_sec)
 
     tools = build_forge_tools(settings, use_remote_mcp=use_remote_mcp)
     prompt = _build_forge_prompt(
@@ -515,17 +556,20 @@ def forge_skill(
         adaptation_hint=adaptation_hint,
         repair_feedback=repair_feedback,
     )
+    environment_param = resolve_forge_environment(settings)
 
-    interaction = client.interactions.create(
+    interaction = beta_client.interactions.create(
         agent=agent_id,
         input=prompt,
-        environment="remote",
+        environment=environment_param,
         tools=tools,
     )
-    interaction = _wait_for_interaction(client, interaction, poll_interval_sec=poll_interval_sec)
+    interaction = _wait_for_interaction(beta_client, interaction, poll_interval_sec=poll_interval_sec)
 
     interaction_id = _get_field(interaction, "id")
-    env_id = _get_field(interaction, "environment_id")
+    env_id = _get_field(interaction, "environment_id") or (
+        environment_param if environment_param != "remote" else None
+    )
     status = _get_field(interaction, "status")
     raw_output = _extract_interaction_text(interaction)
 
@@ -538,6 +582,8 @@ def forge_skill(
             environment_id=str(env_id) if env_id else None,
             interaction_id=str(interaction_id) if interaction_id else None,
             raw_output=raw_output,
+            model_used=target_model,
+            escalated_to_carbon=deep,
         )
 
     payload = extract_json_object(raw_output)
@@ -551,6 +597,8 @@ def forge_skill(
             environment_id=str(env_id) if env_id else None,
             interaction_id=str(interaction_id) if interaction_id else None,
             raw_output=raw_output,
+            model_used=target_model,
+            escalated_to_carbon=deep,
         )
 
     raw_keyframes = payload.get("keyframes")
@@ -658,6 +706,126 @@ def forge_skill(
         environment_id=str(env_id) if env_id else None,
         interaction_id=str(interaction_id) if interaction_id else None,
         raw_output=raw_output,
+        model_used=target_model,
+        escalated_to_carbon=deep,
+    )
+
+
+def _format_violation_diagnostics(attempt_idx: int, result: ForgeResult) -> str:
+    if result.artifact is None:
+        return f"Neon attempt {attempt_idx} returned no artifact ({result.refusal_reason})."
+    kin = result.artifact.kinematics
+    violations = "; ".join(kin.violations) or "Unknown verification failure"
+    return (
+        f"Neon attempt {attempt_idx} failed deterministic kinematics verification "
+        f"(peak_tilt={kin.peak_torso_tilt_deg:.1f} deg, clipping={kin.joint_clipping_count}, "
+        f"max_slew={kin.max_slew_rate_pps:.1f} pps): {violations}"
+    )
+
+
+def forge_skill_with_escalation(
+    beta_client: Any,
+    settings: RoboHarnessSettings,
+    pose_seq: PoseSequence,
+    skill_name: str,
+    *,
+    source_video: str = "",
+    adaptation_hint: str | None = None,
+    repair_feedback: str | None = None,
+    use_remote_mcp: bool = False,
+    deep: bool = False,
+    max_neon_attempts: int = 2,
+    auto_repair_locally: bool = False,
+    ensure_agent: bool = True,
+    poll_interval_sec: float = 1.0,
+) -> ForgeResult:
+    """Forge a skill on Neon and escalate to Carbon on --deep or 2 failed verifications."""
+    if deep:
+        result = forge_skill(
+            beta_client,
+            settings,
+            pose_seq,
+            skill_name,
+            source_video=source_video,
+            adaptation_hint=adaptation_hint,
+            repair_feedback=repair_feedback,
+            use_remote_mcp=use_remote_mcp,
+            deep=True,
+            auto_repair_locally=auto_repair_locally,
+            ensure_agent=ensure_agent,
+            poll_interval_sec=poll_interval_sec,
+        )
+        return replace(
+            result,
+            model_used=settings.forge_deep_model,
+            escalated_to_carbon=True,
+        )
+
+    diagnostics: list[str] = []
+    if repair_feedback:
+        diagnostics.append(repair_feedback)
+
+    attempts = max(1, max_neon_attempts)
+    for attempt_idx in range(1, attempts + 1):
+        combined_feedback = "\n".join(diagnostics) if diagnostics else None
+        neon_res = forge_skill(
+            beta_client,
+            settings,
+            pose_seq,
+            skill_name,
+            source_video=source_video,
+            adaptation_hint=adaptation_hint,
+            repair_feedback=combined_feedback,
+            use_remote_mcp=use_remote_mcp,
+            deep=False,
+            auto_repair_locally=auto_repair_locally,
+            ensure_agent=ensure_agent,
+            poll_interval_sec=poll_interval_sec,
+        )
+        if neon_res.refused or (
+            neon_res.artifact is not None and neon_res.artifact.kinematics.verified
+        ):
+            return replace(
+                neon_res,
+                model_used=settings.forge_model,
+                escalated_to_carbon=False,
+            )
+
+        diagnostics.append(_format_violation_diagnostics(attempt_idx, neon_res))
+
+    # Escalate automatically to gemini-4-carbon with full violation diagnostics
+    logger.warning(
+        "Escalating skill '%s' from %s to %s after %d failed verification attempts.",
+        skill_name,
+        settings.forge_model,
+        settings.forge_deep_model,
+        attempts,
+    )
+    escalation_feedback = (
+        f"ESCALATED TO {settings.forge_deep_model} after {attempts} failed "
+        f"{settings.forge_model} kinematics verification attempts.\n"
+        + "\n".join(diagnostics)
+        + "\nRepair all joint bounds, slew rates, and CoM/tilt limits (< 30 deg), "
+        "projecting lower body to grounded knee-bounce if needed, or explicitly refuse."
+    )
+    carbon_res = forge_skill(
+        beta_client,
+        settings,
+        pose_seq,
+        skill_name,
+        source_video=source_video,
+        adaptation_hint=adaptation_hint,
+        repair_feedback=escalation_feedback,
+        use_remote_mcp=use_remote_mcp,
+        deep=True,
+        auto_repair_locally=auto_repair_locally,
+        ensure_agent=ensure_agent,
+        poll_interval_sec=poll_interval_sec,
+    )
+    return replace(
+        carbon_res,
+        model_used=settings.forge_deep_model,
+        escalated_to_carbon=True,
     )
 
 
@@ -673,18 +841,20 @@ def deterministic_retarget_fallback(
     source_video: str = "",
     force_upper_body_adaptation: bool = False,
 ) -> SkillArtifact:
-    """Pure-math offline 16-DOF retargeter for fast CI/unit tests.
+    """Pure-math offline 16-DOF retargeter for explicit --offline CI/unit tests.
 
     Uses the exact same angle-to-pulse rules (3.2 pulses/deg), joint bounds,
     slew limits, and grounded lower-body adaptation rules as the sandbox skill.
-    Never used in place of the Managed Agent in ``--mode live``.
+    Never used in place of the Managed Agent in live paths (`offline_mode=False`).
     """
     needs_adaptation = force_upper_body_adaptation or bool(pose_seq.impossible_elements)
     adaptation_notes: list[str] = []
 
     if pose_seq.impossible_elements:
         elements = ", ".join(el.element for el in pose_seq.impossible_elements)
-        adaptation_notes.append(f"Adapted impossible motion elements ({elements}) to grounded knee-bounce.")
+        adaptation_notes.append(
+            f"Adapted impossible motion elements ({elements}) to grounded knee-bounce."
+        )
 
     for kf in pose_seq.keyframes:
         if kf.foot_contact == "airborne":
@@ -712,7 +882,6 @@ def deterministic_retarget_fallback(
     for idx, kf in enumerate(pose_seq.keyframes):
         servos: dict[str, int] = dict(NEUTRAL_POSE)
 
-        # Expressive mirrored upper body (3.2 pulses/deg clamped to joint spec)
         servos["r_shoulder_pitch"] = _clamp_joint(
             "r_shoulder_pitch", 500.0 + kf.r_shoulder_pitch_deg * PULSES_PER_DEG
         )

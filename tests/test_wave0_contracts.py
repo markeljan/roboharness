@@ -6,9 +6,16 @@ import pytest
 
 from roboharness.config import (
     API_VERSION,
+    BETA_API_VERSION,
+    DECISION_CONFIDENCE_THRESHOLD,
+    DECISION_SAFETY_PROB_THRESHOLD,
+    FORBIDDEN_GEMINI4_PARAMS,
     FORGE_AGENT_ID,
+    FORGE_DEEP_AGENT_ID,
+    FORGE_DEEP_MODEL,
     REMOTE_MCP_NAME,
     RESERVED_AGENT_ID_PREFIXES,
+    STABLE_API_VERSION,
     VALID_THINKING_LEVELS,
     RoboHarnessSettings,
     load_dotenv_if_present,
@@ -36,9 +43,18 @@ def test_tonypi_has_16_unique_joints() -> None:
 
 
 def test_config_invariants() -> None:
+    assert STABLE_API_VERSION == "v1"
+    assert BETA_API_VERSION == "v1beta"
     assert API_VERSION == "v1beta"
     assert "minimal" not in VALID_THINKING_LEVELS
     assert not FORGE_AGENT_ID.startswith(RESERVED_AGENT_ID_PREFIXES)
+    assert not FORGE_DEEP_AGENT_ID.startswith(RESERVED_AGENT_ID_PREFIXES)
+    assert FORGE_DEEP_MODEL == "gemini-4-carbon"
+    assert FORGE_DEEP_AGENT_ID == "roboharness-skill-forge-carbon"
+    assert DECISION_CONFIDENCE_THRESHOLD == 0.75
+    assert DECISION_SAFETY_PROB_THRESHOLD == 0.75
+    assert "max_total_tokens" in FORBIDDEN_GEMINI4_PARAMS
+    assert "max_output_tokens" in FORBIDDEN_GEMINI4_PARAMS
     assert REMOTE_MCP_NAME == "tonypi_mcp"
 
 
@@ -95,18 +111,27 @@ def test_dotenv_loading_and_env_precedence(
         "# Comment line\n"
         'GEMINI_API_KEY="from-dotenv-key"\n'
         "export TONYPI_MCP_URL='http://10.0.0.5:8765/mcp'\n"
+        "GEMINI_ENVIRONMENT_ID=env_self_hosted_mujoco\n"
         "ROBOHARNESS_WEBCAM_DEVICE=2 # inline comment\n",
         encoding="utf-8",
     )
 
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    # Register keys with monkeypatch first so teardown cleanly removes vars added by dotenv
+    for env_key in (
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_ENVIRONMENT_ID",
+        "TONYPI_MCP_URL",
+        "ROBOHARNESS_WEBCAM_DEVICE",
+    ):
+        monkeypatch.setenv(env_key, "")
+        monkeypatch.delenv(env_key, raising=False)
     monkeypatch.setenv("TONYPI_MCP_URL", "http://127.0.0.1:9999/mcp")
-    monkeypatch.delenv("ROBOHARNESS_WEBCAM_DEVICE", raising=False)
 
     load_dotenv_if_present(env_file)
     settings = RoboHarnessSettings.from_env(env_file)
 
     assert settings.gemini_api_key == "from-dotenv-key"
     assert settings.tonypi_mcp_url == "http://127.0.0.1:9999/mcp"
+    assert settings.gemini_environment_id == "env_self_hosted_mujoco"
     assert settings.webcam_device == "2"

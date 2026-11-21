@@ -1,4 +1,19 @@
-"""End-to-end 4-model RoboHarness MimicPipeline and preflight verification."""
+"""End-to-end Dual-Client 4-Model (+ Carbon Escalation) RoboHarness MimicPipeline.
+
+Dual-client routing (Gemini 4 Hackathon Builder Guide):
+- Stable ``v1`` client (`clients.client`): GA Gemini 4 Interactions API calls —
+  ``gemini-4-hydrogen`` motion extraction (Agentic Video Processing) & live
+  reflex speech (plus ``gemini-4-neon`` / ``gemini-4-carbon`` Interactions).
+- Beta ``v1beta`` client (`clients.beta_client`): Managed Agent Skill Forge
+  (``roboharness-skill-forge`` on ``gemini-4-neon``, escalating to
+  ``roboharness-skill-forge-carbon`` on ``gemini-4-carbon``), Environments,
+  0-output-token ``gemini-decision-1`` pre/post-run gates (``confidence >= 0.75``
+  AND ``is_physically_safe >= 0.75``), and preview robotics model
+  ``gemini-robotics-er-2-preview`` spatial framing.
+
+Zero mocked demo fallbacks in live paths: when ``offline_mode=False``, missing
+``DualGenAIClients`` raises ``RuntimeError`` immediately.
+"""
 
 from __future__ import annotations
 
@@ -12,17 +27,26 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from roboharness.capture import CaptureError, extract_preview_frames
-from roboharness.config import RoboHarnessSettings
+from roboharness.config import (
+    BETA_API_VERSION,
+    STABLE_API_VERSION,
+    RoboHarnessSettings,
+)
 from roboharness.decision_gate import evaluate_post_run, evaluate_pre_execution
-from roboharness.genai_client import build_gemini4_generation_config, extract_interaction_text
 from roboharness.managed_forge import (
     ForgeResult,
     deterministic_retarget_fallback,
     ensure_forge_agent,
-    forge_skill,
+    forge_skill_with_escalation,
+    resolve_forge_environment,
 )
 from roboharness.mcp_client import MCPClientError, TonypiMCPClient
 from roboharness.mock_mcp import MockTonypiMCPServer
+from roboharness.models import (
+    DualGenAIClients,
+    build_gemini4_generation_config,
+    extract_interaction_text,
+)
 from roboharness.motion_extractor import extract_motion_from_video, run_live_reflex_announcement
 from roboharness.safety import (
     check_robot_telemetry,
@@ -45,6 +69,10 @@ from roboharness.spatial import check_workspace_framing
 from roboharness.telemetry_sse import TelemetryHub
 
 logger = logging.getLogger(__name__)
+
+_LIVE_CLIENTS_ERROR = (
+    "Live pipeline requires DualGenAIClients (set GEMINI_API_KEY or pass --offline explicitly)."
+)
 
 MimicStatus = Literal[
     "executed_and_saved",
@@ -70,6 +98,8 @@ class MimicResult(BaseModel):
     execution: ExecutionTrace | None = None
     announcement: str = ""
     forge_attempts: int = 0
+    forge_model_used: str = ""
+    escalated_to_carbon: bool = False
 
 
 class CheckItem(BaseModel):
@@ -88,8 +118,23 @@ class PreflightReport(BaseModel):
     items: list[CheckItem] = Field(default_factory=list)
 
 
+def _resolve_dual_clients(
+    *,
+    clients: DualGenAIClients | None,
+    client: Any | None,
+    beta_client: Any | None,
+) -> tuple[Any | None, Any | None]:
+    if clients is not None:
+        return clients.client, clients.beta_client
+    if isinstance(client, DualGenAIClients):
+        return client.client, client.beta_client
+    resolved_v1 = client
+    resolved_beta = beta_client if beta_client is not None else client
+    return resolved_v1, resolved_beta
+
+
 def _offline_synthetic_wave_pose(skill_name: str) -> PoseSequence:
-    """Deterministic grounded greeting-wave PoseSequence used in offline mode without a client."""
+    """Deterministic grounded greeting-wave PoseSequence used ONLY when offline_mode=True."""
     return PoseSequence(
         source_description=f"Offline synthetic greeting wave for '{skill_name}'",
         bpm=112.0,
@@ -179,8 +224,9 @@ def _offline_decision_gate(
     status: RobotStatus,
     *,
     confidence_threshold: float,
+    safety_prob_threshold: float,
 ) -> DecisionGateResult:
-    """Deterministic local decision gate when running with offline_mode=True and client=None."""
+    """Deterministic local decision gate used ONLY when offline_mode=True."""
     telemetry_ok = check_robot_telemetry(status).safe
     has_hard_refusal = any(
         el.suggested_adaptation.strip().lower() == "refuse"
@@ -221,10 +267,13 @@ def _offline_decision_gate(
             effective_action="repair_in_forge",
         )
 
+    safe_prob = 0.95
+    conf = 0.94
+    can_auto = conf >= confidence_threshold and safe_prob >= safety_prob_threshold
     fidelity = 2.6 if artifact.adaptation_mode == "full_body" else 2.2
     return DecisionGateResult(
-        is_physically_safe_prob=0.95,
-        is_physically_safe_conf=0.94,
+        is_physically_safe_prob=safe_prob,
+        is_physically_safe_conf=conf,
         needs_lower_body_adaptation_prob=0.15 if artifact.adaptation_mode == "full_body" else 0.75,
         needs_lower_body_adaptation_conf=0.90,
         move_fidelity_score=fidelity,
@@ -232,26 +281,43 @@ def _offline_decision_gate(
         move_fidelity_conf=0.91,
         route="execute_and_save",
         route_probabilities={"execute_and_save": 0.93, "other": 0.07},
-        route_conf=0.94,
-        min_confidence=0.94,
-        auto_branch_allowed=0.94 >= confidence_threshold,
-        effective_action="execute_and_save",
+        route_conf=conf,
+        min_confidence=conf,
+        auto_branch_allowed=can_auto,
+        effective_action="execute_and_save" if can_auto else "escalate_human",
     )
 
 
 class MimicPipeline:
-    """Orchestrates the 4-model RoboHarness mimicry & execution workflow."""
+    """Orchestrates the dual-client 4-model (+ Carbon escalation) RoboHarness workflow."""
 
     def __init__(
         self,
         *,
-        client: Any | None,
+        clients: DualGenAIClients | None = None,
+        client: Any | None = None,
+        beta_client: Any | None = None,
         mcp: TonypiMCPClient,
         settings: RoboHarnessSettings,
         hub: TelemetryHub | None = None,
         offline_mode: bool = False,
     ) -> None:
-        self.client = client
+        v1_client, resolved_beta = _resolve_dual_clients(
+            clients=clients,
+            client=client,
+            beta_client=beta_client,
+        )
+        if not offline_mode and (v1_client is None or resolved_beta is None):
+            raise RuntimeError(_LIVE_CLIENTS_ERROR)
+
+        self.v1_client = v1_client
+        self.beta_client = resolved_beta
+        self.client = v1_client
+        self.clients = (
+            DualGenAIClients(client=v1_client, beta_client=resolved_beta)
+            if (v1_client is not None and resolved_beta is not None)
+            else None
+        )
         self.mcp = mcp
         self.settings = settings
         self.hub = hub
@@ -261,11 +327,20 @@ class MimicPipeline:
         if self.hub is not None:
             self.hub.emit(event_type, data)
 
-    def _use_live_models(self) -> bool:
-        return self.client is not None and not self.offline_mode
+    def _require_live_clients(self) -> tuple[Any, Any]:
+        if self.v1_client is None or self.beta_client is None:
+            raise RuntimeError(_LIVE_CLIENTS_ERROR)
+        return self.v1_client, self.beta_client
 
     def _check_hardware_preflight(self, skill_name: str) -> tuple[RobotStatus, str | None]:
-        self._emit("stage", {"stage": "preflight", "skill_name": skill_name, "message": "Checking TonyPi telemetry"})
+        self._emit(
+            "stage",
+            {
+                "stage": "preflight",
+                "skill_name": skill_name,
+                "message": "Checking TonyPi telemetry",
+            },
+        )
         status = self.mcp.get_status()
         verdict = check_robot_telemetry(status)
         self._emit(
@@ -293,9 +368,10 @@ class MimicPipeline:
         *,
         run_spatial: bool,
     ) -> tuple[SpatialFramingResult | None, bytes | None]:
-        if not run_spatial or not self._use_live_models():
+        if not run_spatial or self.offline_mode:
             return None, None
 
+        _, beta_client = self._require_live_clients()
         self._emit(
             "stage",
             {
@@ -319,7 +395,7 @@ class MimicPipeline:
             )
             return None, None
 
-        spatial_res = check_workspace_framing(self.client, frame_jpeg)
+        spatial_res = check_workspace_framing(beta_client, frame_jpeg)
         self._emit(
             "spatial",
             {
@@ -342,10 +418,12 @@ class MimicPipeline:
         adaptation_hint: str | None,
         repair_feedback: str | None,
         use_remote_mcp: bool,
+        deep: bool,
     ) -> ForgeResult:
-        if self._use_live_models():
-            return forge_skill(
-                self.client,
+        if not self.offline_mode:
+            _, beta_client = self._require_live_clients()
+            return forge_skill_with_escalation(
+                beta_client,
                 self.settings,
                 pose_seq,
                 skill_name,
@@ -353,8 +431,10 @@ class MimicPipeline:
                 adaptation_hint=adaptation_hint,
                 repair_feedback=repair_feedback,
                 use_remote_mcp=use_remote_mcp,
+                deep=deep,
             )
 
+        # Explicit offline_mode=True path ONLY
         refuse_elements = [
             el for el in pose_seq.impossible_elements
             if el.suggested_adaptation.strip().lower() == "refuse"
@@ -368,6 +448,8 @@ class MimicPipeline:
                 environment_id=None,
                 interaction_id=None,
                 raw_output="",
+                model_used="offline-deterministic",
+                escalated_to_carbon=False,
             )
 
         artifact = deterministic_retarget_fallback(
@@ -383,6 +465,8 @@ class MimicPipeline:
             environment_id=None,
             interaction_id=None,
             raw_output="",
+            model_used="offline-deterministic",
+            escalated_to_carbon=False,
         )
 
     def _invoke_pre_decision(
@@ -393,14 +477,16 @@ class MimicPipeline:
         status: RobotStatus,
         extra_context: dict[str, Any],
     ) -> DecisionGateResult:
-        if self._use_live_models():
+        if not self.offline_mode:
+            _, beta_client = self._require_live_clients()
             return evaluate_pre_execution(
-                self.client,
+                beta_client,
                 artifact,
                 pose_seq,
                 frame_jpegs,
                 status,
                 confidence_threshold=self.settings.decision_confidence_threshold,
+                safety_prob_threshold=self.settings.decision_safety_prob_threshold,
                 extra_context=extra_context,
             )
         return _offline_decision_gate(
@@ -408,6 +494,7 @@ class MimicPipeline:
             pose_seq,
             status,
             confidence_threshold=self.settings.decision_confidence_threshold,
+            safety_prob_threshold=self.settings.decision_safety_prob_threshold,
         )
 
     def _make_announcement(
@@ -418,11 +505,12 @@ class MimicPipeline:
         frame_jpeg: bytes | None,
     ) -> str:
         fallback = f"Performing verified skill {skill_name} now."
-        if not self._use_live_models():
+        if self.offline_mode:
             return fallback
+        v1_client, _ = self._require_live_clients()
         try:
             return run_live_reflex_announcement(
-                self.client,
+                v1_client,
                 skill_name,
                 description,
                 status,
@@ -474,9 +562,12 @@ class MimicPipeline:
         use_remote_mcp: bool = False,
         speed_scale: float = 1.0,
         force_execute_on_escalate: bool = False,
+        deep: bool = False,
     ) -> MimicResult:
-        """Watch a short video, extract poses, forge, gate, save, and execute on TonyPi."""
-        # Fast telemetry latch before spending API time on video extraction
+        """Watch a short video, extract poses (Agentic Video), forge, gate, save, and execute."""
+        if not self.offline_mode:
+            self._require_live_clients()
+
         _, preflight_err = self._check_hardware_preflight(skill_name)
         if preflight_err is not None:
             self._emit("done", {"stage": "safety_aborted", "status": "safety_aborted", "message": preflight_err})
@@ -502,8 +593,9 @@ class MimicPipeline:
             logger.debug("Preview frame extraction skipped for %s: %s", video_path, exc)
             preview_jpegs = []
 
-        if self._use_live_models():
-            pose_seq = extract_motion_from_video(self.client, video_path, skill_hint=skill_name)
+        if not self.offline_mode:
+            v1_client, _ = self._require_live_clients()
+            pose_seq = extract_motion_from_video(v1_client, video_path, skill_hint=skill_name)
         else:
             pose_seq = _offline_synthetic_wave_pose(skill_name)
 
@@ -529,6 +621,7 @@ class MimicPipeline:
             use_remote_mcp=use_remote_mcp,
             speed_scale=speed_scale,
             force_execute_on_escalate=force_execute_on_escalate,
+            deep=deep,
         )
 
     def mimic_pose(
@@ -543,8 +636,12 @@ class MimicPipeline:
         use_remote_mcp: bool = False,
         speed_scale: float = 1.0,
         force_execute_on_escalate: bool = False,
+        deep: bool = False,
     ) -> MimicResult:
-        """Retarget a PoseSequence via Skill Forge + Decision Gate, save, and optionally execute."""
+        """Retarget a PoseSequence via Skill Forge (Neon -> Carbon) + Decision Gate, save & execute."""
+        if not self.offline_mode:
+            self._require_live_clients()
+
         # 1. Deterministic hardware telemetry pre-flight
         status, preflight_err = self._check_hardware_preflight(skill_name)
         if preflight_err is not None:
@@ -556,7 +653,7 @@ class MimicPipeline:
                 pose_sequence=pose_seq,
             )
 
-        # 2. Optional live spatial workspace framing check
+        # 2. Optional live spatial workspace framing check (v1beta preview model)
         spatial_res, robot_frame_jpeg = self._run_spatial_check(run_spatial=run_spatial)
         adaptation_hint: str | None = None
         if spatial_res is not None:
@@ -581,14 +678,18 @@ class MimicPipeline:
                     },
                 )
 
-        # 3. Managed Agent Skill Forge (Attempt 1)
+        # 3. Managed Agent Skill Forge on v1beta (Neon with automatic Carbon escalation, or --deep)
+        target_agent_label = (
+            self.settings.forge_deep_agent_id if deep else self.settings.managed_agent_id
+        )
         self._emit(
             "stage",
             {
                 "stage": "forge",
-                "model": self.settings.managed_agent_id,
+                "model": target_agent_label,
                 "status": "active",
                 "attempt": 1,
+                "deep": deep,
                 "message": f"Forging 16-DOF skill '{skill_name}'",
             },
         )
@@ -600,16 +701,19 @@ class MimicPipeline:
             adaptation_hint=adaptation_hint,
             repair_feedback=None,
             use_remote_mcp=use_remote_mcp,
+            deep=deep,
         )
         if forge_res.refused or forge_res.artifact is None:
             reason = forge_res.refusal_reason or "Motion refused by Managed Agent Skill Forge."
             self._emit(
                 "forge",
                 {
-                    "model": self.settings.managed_agent_id,
+                    "model": target_agent_label,
                     "status": "done",
                     "attempt": forge_attempts,
                     "refused": True,
+                    "model_used": forge_res.model_used,
+                    "escalated_to_carbon": forge_res.escalated_to_carbon,
                     "message": reason,
                 },
             )
@@ -621,28 +725,34 @@ class MimicPipeline:
                 pose_sequence=pose_seq,
                 spatial=spatial_res,
                 forge_attempts=forge_attempts,
+                forge_model_used=forge_res.model_used,
+                escalated_to_carbon=forge_res.escalated_to_carbon,
             )
 
         artifact = forge_res.artifact
+        forge_model_used = forge_res.model_used
+        escalated_to_carbon = forge_res.escalated_to_carbon
         self._emit(
             "forge",
             {
-                "model": self.settings.managed_agent_id,
+                "model": target_agent_label,
                 "status": "done",
                 "attempt": forge_attempts,
                 "verified": artifact.kinematics.verified,
                 "peak_torso_tilt_deg": artifact.kinematics.peak_torso_tilt_deg,
                 "joint_clipping_count": artifact.kinematics.joint_clipping_count,
                 "adaptation_mode": artifact.adaptation_mode,
+                "model_used": forge_model_used,
+                "escalated_to_carbon": escalated_to_carbon,
                 "message": (
-                    f"Forged {len(artifact.keyframes)} keyframes "
+                    f"Forged {len(artifact.keyframes)} keyframes via {forge_model_used} "
                     f"(tilt={artifact.kinematics.peak_torso_tilt_deg:.1f} deg, "
                     f"clip={artifact.kinematics.joint_clipping_count})"
                 ),
             },
         )
 
-        # 4. Pre-execution Decisions API gate (0 output tokens)
+        # 4. Pre-execution Decisions API gate on v1beta (0 output tokens, conf>=0.75 & safe>=0.75)
         decision_frames: list[bytes] = list(preview_jpegs or [])
         if robot_frame_jpeg is not None:
             decision_frames.append(robot_frame_jpeg)
@@ -650,6 +760,8 @@ class MimicPipeline:
         extra_context: dict[str, Any] = {
             "forge_attempts": forge_attempts,
             "adaptation_hint": adaptation_hint,
+            "forge_model_used": forge_model_used,
+            "escalated_to_carbon": escalated_to_carbon,
         }
         if spatial_res is not None:
             extra_context["spatial_framing"] = spatial_res.model_dump(mode="json")
@@ -687,7 +799,10 @@ class MimicPipeline:
         # 5. Bounded 1-shot repair loop when Decision Gate requests repair_in_forge
         if pre_decision.effective_action == "repair_in_forge":
             forge_attempts = 2
-            violations_text = "; ".join(artifact.kinematics.violations) or "Decision gate requested balance/fidelity repair."
+            violations_text = (
+                "; ".join(artifact.kinematics.violations)
+                or "Decision gate requested balance/fidelity repair."
+            )
             repair_feedback = (
                 f"Previous attempt failed gate (safe_prob={pre_decision.is_physically_safe_prob:.2f}, "
                 f"needs_lower_body_adaptation={pre_decision.needs_lower_body_adaptation_prob:.2f}, "
@@ -698,7 +813,7 @@ class MimicPipeline:
                 "stage",
                 {
                     "stage": "forge",
-                    "model": self.settings.managed_agent_id,
+                    "model": target_agent_label,
                     "status": "active",
                     "attempt": forge_attempts,
                     "message": "Running bounded forge repair pass (attempt 2)",
@@ -711,7 +826,10 @@ class MimicPipeline:
                 adaptation_hint=adaptation_hint,
                 repair_feedback=repair_feedback,
                 use_remote_mcp=use_remote_mcp,
+                deep=deep,
             )
+            forge_model_used = repair_res.model_used
+            escalated_to_carbon = escalated_to_carbon or repair_res.escalated_to_carbon
             if repair_res.refused or repair_res.artifact is None:
                 reason = repair_res.refusal_reason or "Skill refused during forge repair pass."
                 self._emit("done", {"stage": "refused", "status": "refused", "message": reason})
@@ -724,22 +842,28 @@ class MimicPipeline:
                     artifact=artifact,
                     pre_decision=pre_decision,
                     forge_attempts=forge_attempts,
+                    forge_model_used=forge_model_used,
+                    escalated_to_carbon=escalated_to_carbon,
                 )
 
             artifact = repair_res.artifact
             self._emit(
                 "forge",
                 {
-                    "model": self.settings.managed_agent_id,
+                    "model": target_agent_label,
                     "status": "done",
                     "attempt": forge_attempts,
                     "verified": artifact.kinematics.verified,
                     "peak_torso_tilt_deg": artifact.kinematics.peak_torso_tilt_deg,
                     "joint_clipping_count": artifact.kinematics.joint_clipping_count,
+                    "model_used": forge_model_used,
+                    "escalated_to_carbon": escalated_to_carbon,
                     "message": f"Repair attempt 2 verified={artifact.kinematics.verified}",
                 },
             )
             extra_context["forge_attempts"] = forge_attempts
+            extra_context["forge_model_used"] = forge_model_used
+            extra_context["escalated_to_carbon"] = escalated_to_carbon
             pre_decision = self._invoke_pre_decision(
                 artifact, pose_seq, decision_frames, status, extra_context
             )
@@ -779,11 +903,16 @@ class MimicPipeline:
                 artifact=artifact,
                 pre_decision=pre_decision,
                 forge_attempts=forge_attempts,
+                forge_model_used=forge_model_used,
+                escalated_to_carbon=escalated_to_carbon,
             )
         elif pre_decision.effective_action == "escalate_human" and not force_execute_on_escalate:
             reason = (
-                f"Escalated to human review: confidence {pre_decision.min_confidence:.2f} "
-                f"< {self.settings.decision_confidence_threshold:.2f} (route={pre_decision.route})."
+                f"Escalated to human review: confidence={pre_decision.min_confidence:.2f} "
+                f"(min {self.settings.decision_confidence_threshold:.2f}), "
+                f"safe_prob={pre_decision.is_physically_safe_prob:.2f} "
+                f"(min {self.settings.decision_safety_prob_threshold:.2f}), "
+                f"route={pre_decision.route}."
             )
             self._emit("done", {"stage": "escalated_human", "status": "escalated_human", "message": reason})
             return MimicResult(
@@ -795,6 +924,8 @@ class MimicPipeline:
                 artifact=artifact,
                 pre_decision=pre_decision,
                 forge_attempts=forge_attempts,
+                forge_model_used=forge_model_used,
+                escalated_to_carbon=escalated_to_carbon,
             )
         elif pre_decision.effective_action == "repair_in_forge":
             reason = (
@@ -811,9 +942,10 @@ class MimicPipeline:
                 artifact=artifact,
                 pre_decision=pre_decision,
                 forge_attempts=forge_attempts,
+                forge_model_used=forge_model_used,
+                escalated_to_carbon=escalated_to_carbon,
             )
 
-        # Enforce edge_risk upper-body safety projection if not already adapted
         if (
             spatial_res is not None
             and spatial_res.clearance_margin == "edge_risk"
@@ -847,6 +979,8 @@ class MimicPipeline:
                 artifact=artifact,
                 pre_decision=pre_decision,
                 forge_attempts=forge_attempts,
+                forge_model_used=forge_model_used,
+                escalated_to_carbon=escalated_to_carbon,
             )
 
         # 8. Save verified, signed skill artifact
@@ -873,9 +1007,11 @@ class MimicPipeline:
                 artifact=artifact,
                 pre_decision=pre_decision,
                 forge_attempts=forge_attempts,
+                forge_model_used=forge_model_used,
+                escalated_to_carbon=escalated_to_carbon,
             )
 
-        # 9. Announce + Execute on TonyPi MCP + Post-run fidelity audit
+        # 9. Announce (v1) + Execute on TonyPi MCP + Post-run fidelity audit (v1beta)
         announcement = self._make_announcement(
             skill_name, artifact.description, status, robot_frame_jpeg
         )
@@ -933,22 +1069,26 @@ class MimicPipeline:
                 execution=execution,
                 announcement=announcement,
                 forge_attempts=forge_attempts,
+                forge_model_used=forge_model_used,
+                escalated_to_carbon=escalated_to_carbon,
             )
 
         post_decision: DecisionGateResult | None = None
-        if self._use_live_models():
+        if not self.offline_mode:
+            _, beta_client = self._require_live_clients()
             post_run_jpeg = (
                 base64.b64decode(execution.post_run_frame_b64)
                 if execution.post_run_frame_b64
                 else None
             )
             post_decision = evaluate_post_run(
-                self.client,
+                beta_client,
                 artifact,
                 decision_frames,
                 post_run_jpeg,
                 execution.final_status,
                 confidence_threshold=self.settings.decision_confidence_threshold,
+                safety_prob_threshold=self.settings.decision_safety_prob_threshold,
             )
             artifact = sign_skill_artifact(
                 artifact.model_copy(
@@ -992,6 +1132,8 @@ class MimicPipeline:
             execution=execution,
             announcement=announcement,
             forge_attempts=forge_attempts,
+            forge_model_used=forge_model_used,
+            escalated_to_carbon=escalated_to_carbon,
         )
 
     def run_saved_skill(
@@ -1003,6 +1145,9 @@ class MimicPipeline:
         speed_scale: float = 1.0,
     ) -> MimicResult:
         """Load a signed skill from skills/, verify safety latches, and replay on TonyPi."""
+        if not self.offline_mode:
+            self._require_live_clients()
+
         artifact = load_skill(skill_name, self.settings.skills_dir, verify_signature=True)
         skill_file = self.settings.skills_dir / f"{slugify_skill_name(skill_name)}.json"
 
@@ -1101,19 +1246,21 @@ class MimicPipeline:
             )
 
         post_decision: DecisionGateResult | None = None
-        if self._use_live_models():
+        if not self.offline_mode:
+            _, beta_client = self._require_live_clients()
             post_run_jpeg = (
                 base64.b64decode(execution.post_run_frame_b64)
                 if execution.post_run_frame_b64
                 else None
             )
             post_decision = evaluate_post_run(
-                self.client,
+                beta_client,
                 artifact,
                 [robot_frame_jpeg] if robot_frame_jpeg else [],
                 post_run_jpeg,
                 execution.final_status,
                 confidence_threshold=self.settings.decision_confidence_threshold,
+                safety_prob_threshold=self.settings.decision_safety_prob_threshold,
             )
             artifact = sign_skill_artifact(
                 artifact.model_copy(
@@ -1145,77 +1292,100 @@ class MimicPipeline:
 
 
 def run_preflight_check(
-    client: Any | None,
-    mcp: TonypiMCPClient | None,
-    settings: RoboHarnessSettings,
+    client: Any | None = None,
+    mcp: TonypiMCPClient | None = None,
+    settings: RoboHarnessSettings | None = None,
     *,
+    clients: DualGenAIClients | None = None,
+    beta_client: Any | None = None,
     skip_forge_create: bool = False,
 ) -> PreflightReport:
-    """Verify all 4 Gemini 4 models and the TonyPi Streamable HTTP MCP boundary."""
+    """Verify stable v1 + v1beta Gemini 4 models and TonyPi Streamable HTTP MCP."""
+    resolved_settings = settings if settings is not None else RoboHarnessSettings.from_env()
+    v1_client, resolved_beta = _resolve_dual_clients(
+        clients=clients,
+        client=client,
+        beta_client=beta_client,
+    )
     items: list[CheckItem] = []
 
-    # 1. gemini-4-hydrogen ping
+    # 1. gemini-4-hydrogen ping (stable v1)
     t0 = time.perf_counter()
-    if client is None:
+    if v1_client is None:
         items.append(
             CheckItem(
-                component=settings.motion_model,
+                component=resolved_settings.motion_model,
                 ok=False,
-                detail="Gemini client unavailable (set GEMINI_API_KEY).",
+                detail=f"[{STABLE_API_VERSION}] Gemini v1 client unavailable (set GEMINI_API_KEY).",
             )
         )
     else:
         try:
-            resp = client.interactions.create(
-                model=settings.motion_model,
+            resp = v1_client.interactions.create(
+                model=resolved_settings.motion_model,
                 input=[{"type": "text", "text": "Reply with OK."}],
-                generation_config=build_gemini4_generation_config("low"),
+                generation_config=build_gemini4_generation_config("medium"),
             )
             text = extract_interaction_text(resp).strip()
             items.append(
                 CheckItem(
-                    component=settings.motion_model,
+                    component=resolved_settings.motion_model,
                     ok=bool(text),
-                    detail=f"Responded: {text[:60]!r}" if text else "Empty response from model.",
+                    detail=(
+                        f"[{STABLE_API_VERSION}] Responded: {text[:60]!r}"
+                        if text
+                        else f"[{STABLE_API_VERSION}] Empty response from model."
+                    ),
                     latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
                 )
             )
         except Exception as exc:  # noqa: BLE001
             items.append(
                 CheckItem(
-                    component=settings.motion_model,
+                    component=resolved_settings.motion_model,
                     ok=False,
-                    detail=f"Ping failed: {exc}",
+                    detail=f"[{STABLE_API_VERSION}] Ping failed: {exc}",
                     latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
                 )
             )
 
-    # 2. roboharness-skill-forge Managed Agent check/create
+    # 2. roboharness-skill-forge Managed Agent check/create (v1beta)
     t0 = time.perf_counter()
-    if client is None:
+    env_label = resolve_forge_environment(resolved_settings)
+    env_note = (
+        f"GEMINI_ENVIRONMENT_ID={env_label}"
+        if resolved_settings.gemini_environment_id
+        else 'env="remote"'
+    )
+    if resolved_beta is None:
         items.append(
             CheckItem(
-                component=settings.managed_agent_id,
+                component=resolved_settings.managed_agent_id,
                 ok=False,
-                detail="Gemini client unavailable (set GEMINI_API_KEY).",
+                detail=f"[{BETA_API_VERSION}] Gemini v1beta client unavailable ({env_note}).",
             )
         )
     else:
         try:
             if skip_forge_create:
-                existing = client.agents.get(id=settings.managed_agent_id)
+                existing = resolved_beta.agents.get(id=resolved_settings.managed_agent_id)
                 ok = existing is not None
-                detail = f"Found agent '{settings.managed_agent_id}'." if ok else "Agent not found."
+                detail = (
+                    f"[{BETA_API_VERSION}] Found agent '{resolved_settings.managed_agent_id}' ({env_note})."
+                    if ok
+                    else f"[{BETA_API_VERSION}] Agent not found ({env_note})."
+                )
             else:
-                state = ensure_forge_agent(client, settings)
+                state = ensure_forge_agent(resolved_beta, resolved_settings)
                 ok = True
                 detail = (
-                    f"Ready (model={state.model}, env={state.base_environment_id or 'inline'}, "
+                    f"[{BETA_API_VERSION}] Ready (model={state.model}, "
+                    f"env={state.base_environment_id or env_label}, {env_note}, "
                     f"created={state.created_now})"
                 )
             items.append(
                 CheckItem(
-                    component=settings.managed_agent_id,
+                    component=resolved_settings.managed_agent_id,
                     ok=ok,
                     detail=detail,
                     latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
@@ -1224,27 +1394,27 @@ def run_preflight_check(
         except Exception as exc:  # noqa: BLE001
             items.append(
                 CheckItem(
-                    component=settings.managed_agent_id,
+                    component=resolved_settings.managed_agent_id,
                     ok=False,
-                    detail=f"Forge agent check failed: {exc}",
+                    detail=f"[{BETA_API_VERSION}] Forge agent check failed ({env_note}): {exc}",
                     latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
                 )
             )
 
-    # 3. gemini-decision-1 tiny noul ping
+    # 3. gemini-decision-1 tiny noul ping (v1beta)
     t0 = time.perf_counter()
-    if client is None:
+    if resolved_beta is None:
         items.append(
             CheckItem(
-                component=settings.decision_model,
+                component=resolved_settings.decision_model,
                 ok=False,
-                detail="Gemini client unavailable (set GEMINI_API_KEY).",
+                detail=f"[{BETA_API_VERSION}] Gemini v1beta client unavailable (set GEMINI_API_KEY).",
             )
         )
     else:
         try:
-            dec_resp = client.decisions.create(
-                model=settings.decision_model,
+            dec_resp = resolved_beta.decisions.create(
+                model=resolved_settings.decision_model,
                 input=[{"type": "text", "text": json.dumps({"battery_v": 11.6, "standing": True})}],
                 questions={
                     "health_check": {
@@ -1253,56 +1423,64 @@ def run_preflight_check(
                     }
                 },
             )
-            answers = dec_resp.get("answers") if isinstance(dec_resp, dict) else getattr(dec_resp, "answers", None)
+            answers = (
+                dec_resp.get("answers")
+                if isinstance(dec_resp, dict)
+                else getattr(dec_resp, "answers", None)
+            )
             hc = answers.get("health_check") if isinstance(answers, dict) else None
             noul = hc.get("noul") if isinstance(hc, dict) else getattr(hc, "noul", None)
             conf = hc.get("confidence") if isinstance(hc, dict) else getattr(hc, "confidence", None)
             items.append(
                 CheckItem(
-                    component=settings.decision_model,
+                    component=resolved_settings.decision_model,
                     ok=hc is not None,
-                    detail=f"0-token noul={noul}, conf={conf}" if hc is not None else "Missing health_check answer.",
+                    detail=(
+                        f"[{BETA_API_VERSION}] 0-token noul={noul}, conf={conf}"
+                        if hc is not None
+                        else f"[{BETA_API_VERSION}] Missing health_check answer."
+                    ),
                     latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
                 )
             )
         except Exception as exc:  # noqa: BLE001
             items.append(
                 CheckItem(
-                    component=settings.decision_model,
+                    component=resolved_settings.decision_model,
                     ok=False,
-                    detail=f"Decisions API ping failed: {exc}",
+                    detail=f"[{BETA_API_VERSION}] Decisions API ping failed: {exc}",
                     latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
                 )
             )
 
-    # 4. gemini-robotics-er-2-preview tiny spatial image ping
+    # 4. gemini-robotics-er-2-preview spatial image ping (v1beta preview model)
     t0 = time.perf_counter()
-    if client is None:
+    if resolved_beta is None:
         items.append(
             CheckItem(
-                component=settings.spatial_model,
+                component=resolved_settings.spatial_model,
                 ok=False,
-                detail="Gemini client unavailable (set GEMINI_API_KEY).",
+                detail=f"[{BETA_API_VERSION}] Gemini v1beta client unavailable (set GEMINI_API_KEY).",
             )
         )
     else:
         try:
             probe_jpeg = MockTonypiMCPServer().render_camera_jpeg()
-            sp = check_workspace_framing(client, probe_jpeg)
+            sp = check_workspace_framing(resolved_beta, probe_jpeg)
             items.append(
                 CheckItem(
-                    component=settings.spatial_model,
+                    component=resolved_settings.spatial_model,
                     ok=True,
-                    detail=f"margin={sp.clearance_margin}, clear={sp.workspace_clear}",
+                    detail=f"[{BETA_API_VERSION}] margin={sp.clearance_margin}, clear={sp.workspace_clear}",
                     latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
                 )
             )
         except Exception as exc:  # noqa: BLE001
             items.append(
                 CheckItem(
-                    component=settings.spatial_model,
+                    component=resolved_settings.spatial_model,
                     ok=False,
-                    detail=f"Spatial ping failed: {exc}",
+                    detail=f"[{BETA_API_VERSION}] Spatial ping failed: {exc}",
                     latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
                 )
             )
@@ -1314,7 +1492,7 @@ def run_preflight_check(
             CheckItem(
                 component="tonypi_mcp",
                 ok=False,
-                detail=f"MCP client not configured ({settings.tonypi_mcp_url}).",
+                detail=f"MCP client not configured ({resolved_settings.tonypi_mcp_url}).",
             )
         )
     else:
@@ -1339,7 +1517,7 @@ def run_preflight_check(
                 CheckItem(
                     component="tonypi_mcp",
                     ok=False,
-                    detail=f"MCP check failed ({settings.tonypi_mcp_url}): {exc}",
+                    detail=f"MCP check failed ({resolved_settings.tonypi_mcp_url}): {exc}",
                     latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
                 )
             )

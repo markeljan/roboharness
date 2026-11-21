@@ -1,4 +1,4 @@
-"""Live tabletop spatial workspace framing check via gemini-robotics-er-2-preview."""
+"""Live tabletop spatial workspace framing check via gemini-robotics-er-2-preview (v1beta beta_client)."""
 
 from __future__ import annotations
 
@@ -6,8 +6,9 @@ import base64
 from typing import Any, Final
 
 from roboharness.config import SPATIAL_MODEL
-from roboharness.genai_client import (
+from roboharness.models import (
     build_gemini4_generation_config,
+    compact_json_schema_for_gemini,
     extract_interaction_text,
     extract_json_from_text,
 )
@@ -47,7 +48,7 @@ def check_workspace_framing(
         response_format={
             "type": "text",
             "mime_type": "application/json",
-            "schema": SpatialFramingResult.model_json_schema(),
+            "schema": compact_json_schema_for_gemini(SpatialFramingResult),
         },
     )
     raw_text = extract_interaction_text(interaction)

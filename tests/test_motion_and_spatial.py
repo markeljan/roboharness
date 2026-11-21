@@ -1,4 +1,4 @@
-"""Offline unit tests for genai_client, motion_extractor, and spatial framing."""
+"""Offline unit tests for models (Dual Clients + agentic video), motion_extractor, and spatial."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from google.genai import interactions as genai_interactions
 
-from roboharness import genai_client
+from roboharness import genai_client, models
 from roboharness.config import (
     API_VERSION,
     FORBIDDEN_GEMINI4_PARAMS,
@@ -19,16 +20,23 @@ from roboharness.config import (
     SPATIAL_MODEL,
     VALID_THINKING_LEVELS,
 )
-from roboharness.genai_client import (
+from roboharness.models import (
+    DualGenAIClients,
     build_gemini4_generation_config,
+    compact_json_schema_for_gemini,
     extract_interaction_text,
     extract_json_from_text,
-    make_client,
+    make_beta_client,
+    make_dual_clients,
+    make_v1_client,
     prepare_video_input,
+    upload_video_agentic,
 )
 from roboharness.motion_extractor import (
     MAX_ANNOUNCEMENT_WORDS,
     BaselineKeyframesPayload,
+    TrialVideoDebugReport,
+    debug_trial_video,
     extract_motion_from_description,
     extract_motion_from_video,
     generate_baseline_raw_keyframes,
@@ -43,7 +51,12 @@ from roboharness.schemas import (
 )
 from roboharness.spatial import check_workspace_framing
 
-FORBIDDEN_KEYS = FORBIDDEN_GEMINI4_PARAMS | {"max_output_tokens", "maxOutputTokens"}
+FORBIDDEN_KEYS = FORBIDDEN_GEMINI4_PARAMS | {
+    "max_output_tokens",
+    "maxOutputTokens",
+    "max_total_tokens",
+    "maxTotalTokens",
+}
 
 
 class _FakeFileState(Enum):
@@ -53,7 +66,13 @@ class _FakeFileState(Enum):
 
 
 class _FakeFilesAPI:
-    def __init__(self, states: list[Any], *, uri: str = "https://files.example/v1beta/files/vid1", mime_type: str | None = "video/mp4") -> None:
+    def __init__(
+        self,
+        states: list[Any],
+        *,
+        uri: str = "https://files.example/v1/files/vid1",
+        mime_type: str | None = "video/mp4",
+    ) -> None:
         self._states = list(states)
         self._uri = uri
         self._mime_type = mime_type
@@ -102,7 +121,10 @@ class _FakeGenAIClient:
         file_mime_type: str | None = "video/mp4",
     ) -> None:
         self.interactions = _FakeInteractionsAPI(responses or [])
-        self.files = _FakeFilesAPI(file_states or [_FakeFileState.ACTIVE], mime_type=file_mime_type)
+        self.files = _FakeFilesAPI(
+            file_states or [_FakeFileState.ACTIVE],
+            mime_type=file_mime_type,
+        )
 
 
 def _sample_pose_sequence_dict() -> dict[str, Any]:
@@ -160,7 +182,33 @@ def _sample_pose_sequence_dict() -> dict[str, Any]:
     }
 
 
-def _assert_gemini4_invariants(call: dict[str, Any], *, expected_model: str, expected_thinking: str) -> None:
+def _sample_debug_report_dict(skill_name: str = "dance_orange_justice") -> dict[str, Any]:
+    return {
+        "skill_name": skill_name,
+        "succeeded": False,
+        "root_cause": "Right ankle slid laterally on the glossy tabletop during beat 2 arm clap.",
+        "slip_detected": True,
+        "suspected_joints": ["r_ankle_roll", "r_hip_roll"],
+        "observations": [
+            {
+                "timestamp_ms": 820,
+                "limb_or_region": "r_ankle",
+                "observation": "Right foot shifted ~1.5 cm outward as torso rolled right.",
+                "severity": "failure",
+            }
+        ],
+        "recommended_fixes": [
+            "Reduce lateral hip roll excursion by 30% and widen keyframe transition duration."
+        ],
+    }
+
+
+def _assert_gemini4_invariants(
+    call: dict[str, Any],
+    *,
+    expected_model: str,
+    expected_thinking: str,
+) -> None:
     assert call["model"] == expected_model
     gen_cfg = call["generation_config"]
     assert gen_cfg["thinking_level"] == expected_thinking
@@ -173,42 +221,68 @@ def _assert_gemini4_invariants(call: dict[str, Any], *, expected_model: str, exp
 
 
 # ---------------------------------------------------------------------------
-# genai_client.py tests
+# Dual Clients (models.py & genai_client.py) tests
 # ---------------------------------------------------------------------------
 
 
-def test_make_client_locks_v1beta_and_resolves_env_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_make_v1_and_beta_clients_enforce_api_version_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: list[dict[str, Any]] = []
 
     class _DummyClient:
         def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
             captured.append(kwargs)
 
-    monkeypatch.setattr(genai_client.genai, "Client", _DummyClient)
-
-    # Explicit API key wins over env vars.
+    monkeypatch.setattr(models.genai, "Client", _DummyClient)
     monkeypatch.setenv("GEMINI_API_KEY", "from-gemini-env")
     monkeypatch.setenv("GOOGLE_API_KEY", "from-google-env")
-    make_client("explicit-key")
+
+    # Stable v1 client MUST NOT pass http_options={"api_version": "v1beta"}
+    make_v1_client("explicit-v1-key")
+    assert captured[-1] == {"api_key": "explicit-v1-key"}
+    assert "http_options" not in captured[-1]
+
+    # Falls back to GEMINI_API_KEY
+    make_v1_client()
+    assert captured[-1] == {"api_key": "from-gemini-env"}
+
+    # Falls back to GOOGLE_API_KEY when GEMINI_API_KEY absent
+    monkeypatch.delenv("GEMINI_API_KEY")
+    make_v1_client()
+    assert captured[-1] == {"api_key": "from-google-env"}
+
+    # Beta client MUST explicitly pass v1beta
+    make_beta_client("explicit-beta-key")
     assert captured[-1] == {
-        "api_key": "explicit-key",
+        "api_key": "explicit-beta-key",
         "http_options": {"api_version": API_VERSION},
     }
 
-    # Falls back to GEMINI_API_KEY.
-    make_client()
-    assert captured[-1] == {
-        "api_key": "from-gemini-env",
+    # Dual clients instantiate paired v1 and v1beta clients
+    dual = make_dual_clients("dual-key")
+    assert isinstance(dual, DualGenAIClients)
+    assert dual.client.kwargs == {"api_key": "dual-key"}
+    assert dual.beta_client.kwargs == {
+        "api_key": "dual-key",
         "http_options": {"api_version": "v1beta"},
     }
 
-    # Falls back to GOOGLE_API_KEY if GEMINI_API_KEY absent.
-    monkeypatch.delenv("GEMINI_API_KEY")
-    make_client()
+    # Legacy alias genai_client.make_client routes to make_beta_client
+    assert genai_client.make_client is make_beta_client
+    genai_client.make_client("legacy-key")
     assert captured[-1] == {
-        "api_key": "from-google-env",
+        "api_key": "legacy-key",
         "http_options": {"api_version": "v1beta"},
     }
+
+
+def test_real_sdk_dual_clients_api_versions() -> None:
+    """Confirm real google-genai Clients configure v1 (default) and v1beta respectively."""
+    dual = make_dual_clients("dummy-test-key")
+    assert dual.client._api_client._http_options.api_version == "v1"
+    assert dual.beta_client._api_client._http_options.api_version == "v1beta"
 
 
 @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh"])
@@ -216,6 +290,7 @@ def test_build_gemini4_generation_config_accepts_valid_levels(level: str) -> Non
     cfg = build_gemini4_generation_config(level)
     assert cfg == {"thinking_level": level}
     assert "max_output_tokens" not in cfg
+    assert "max_total_tokens" not in cfg
 
 
 @pytest.mark.parametrize("bad_level", ["minimal", "none", "ultra", ""])
@@ -233,6 +308,9 @@ def test_build_gemini4_generation_config_rejects_invalid_levels(bad_level: str) 
         {"cachedContents": "cachedContents/abc"},
         {"cached_content": "cachedContents/abc"},
         {"max_output_tokens": 1024},
+        {"maxOutputTokens": 1024},
+        {"max_total_tokens": 8192},
+        {"maxTotalTokens": 8192},
         {"temperature": None},
     ],
 )
@@ -243,32 +321,15 @@ def test_build_gemini4_generation_config_rejects_forbidden_params(
         build_gemini4_generation_config("medium", **forbidden_kwargs)
 
 
-def test_prepare_video_input_inline_for_small_file(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# Agentic Video Processing upload tests
+# ---------------------------------------------------------------------------
+
+
+def test_upload_video_agentic_always_uploads_polls_and_sets_agentic(tmp_path: Path) -> None:
+    # Even tiny 15-byte clip MUST upload via Files API with processing="agentic" (never inline).
     clip = tmp_path / "wave.mp4"
-    payload = b"\x00\x00\x00\x18ftypmp42fakevideo"
-    clip.write_bytes(payload)
-
-    client = _FakeGenAIClient()
-    part = prepare_video_input(client, clip, inline_max_bytes=1024)
-
-    assert part == {
-        "type": "video",
-        "data": base64.b64encode(payload).decode("ascii"),
-        "mime_type": "video/mp4",
-    }
-    assert client.files.uploads == []
-
-
-def test_prepare_video_input_mov_mime_normalization(tmp_path: Path) -> None:
-    clip = tmp_path / "clip.mov"
-    clip.write_bytes(b"fake-mov-data")
-    part = prepare_video_input(_FakeGenAIClient(), clip, inline_max_bytes=1024)
-    assert part["mime_type"] == "video/mov"
-
-
-def test_prepare_video_input_files_api_and_polling_enum_states(tmp_path: Path) -> None:
-    clip = tmp_path / "large.mp4"
-    clip.write_bytes(b"x" * 2048)
+    clip.write_bytes(b"tiny-mp4-clip!!")
 
     client = _FakeGenAIClient(
         file_states=[
@@ -278,57 +339,62 @@ def test_prepare_video_input_files_api_and_polling_enum_states(tmp_path: Path) -
         ],
         file_mime_type=None,
     )
-    part = prepare_video_input(
-        client,
-        clip,
-        inline_max_bytes=512,
-        poll_interval_s=0.0,
-        timeout_s=5.0,
-    )
+    part = upload_video_agentic(client, clip, poll_interval_s=0.0, timeout_s=5.0)
 
     assert part == {
         "type": "video",
-        "uri": "https://files.example/v1beta/files/vid1",
+        "uri": "https://files.example/v1/files/vid1",
         "mime_type": "video/mp4",
+        "processing": "agentic",
     }
+    assert "data" not in part
     assert client.files.uploads == [str(clip)]
     assert client.files.gets == ["files/vid1", "files/vid1"]
+    genai_interactions.VideoContent.model_validate(part)
 
 
-def test_prepare_video_input_files_api_string_states_and_failure_modes(tmp_path: Path) -> None:
-    clip = tmp_path / "large.mp4"
-    clip.write_bytes(b"x" * 1024)
+def test_upload_video_agentic_mov_mime_and_prepare_video_input_delegate(tmp_path: Path) -> None:
+    clip = tmp_path / "clip.mov"
+    clip.write_bytes(b"fake-mov-data")
 
-    # String states: PROCESSING -> ACTIVE
-    ok_client = _FakeGenAIClient(file_states=["PROCESSING", "ACTIVE"])
-    part = prepare_video_input(ok_client, clip, inline_max_bytes=100, poll_interval_s=0.0)
-    assert part["uri"] == "https://files.example/v1beta/files/vid1"
+    client = _FakeGenAIClient(file_states=["PROCESSING", "ACTIVE"], file_mime_type=None)
+    part = prepare_video_input(client, clip, poll_interval_s=0.0)
+
+    assert part == {
+        "type": "video",
+        "uri": "https://files.example/v1/files/vid1",
+        "mime_type": "video/mov",
+        "processing": "agentic",
+    }
+    assert client.files.uploads == [str(clip)]
+
+
+def test_upload_video_agentic_failure_modes(tmp_path: Path) -> None:
+    clip = tmp_path / "broken.mp4"
+    clip.write_bytes(b"x" * 128)
 
     # FAILED state raises RuntimeError
     fail_client = _FakeGenAIClient(file_states=["PROCESSING", "FAILED"])
     with pytest.raises(RuntimeError, match="failed processing"):
-        prepare_video_input(fail_client, clip, inline_max_bytes=100, poll_interval_s=0.0)
+        upload_video_agentic(fail_client, clip, poll_interval_s=0.0)
 
     # Timeout raises TimeoutError
     stuck_client = _FakeGenAIClient(file_states=["PROCESSING"] * 100)
     with pytest.raises(TimeoutError, match="Timed out"):
-        prepare_video_input(
-            stuck_client,
-            clip,
-            inline_max_bytes=100,
-            poll_interval_s=0.0,
-            timeout_s=0.0,
-        )
+        upload_video_agentic(stuck_client, clip, poll_interval_s=0.0, timeout_s=0.0)
 
     # Missing file raises FileNotFoundError
     with pytest.raises(FileNotFoundError):
-        prepare_video_input(ok_client, tmp_path / "does_not_exist.mp4")
+        upload_video_agentic(fail_client, tmp_path / "does_not_exist.mp4")
 
 
 def test_extract_json_from_text_and_interaction_text() -> None:
     assert json.loads(extract_json_from_text('  {"ok": true}  ')) == {"ok": True}
     assert json.loads(extract_json_from_text('```json\n{"ok": 1}\n```')) == {"ok": 1}
-    assert json.loads(extract_json_from_text('Here is the result:\n```\n[1, 2]\n```\nThanks!')) == [1, 2]
+    assert json.loads(extract_json_from_text("Here is the result:\n```\n[1, 2]\n```\nThanks!")) == [
+        1,
+        2,
+    ]
     assert json.loads(extract_json_from_text('Prefix text {"nested": {"a": 2}} trailing')) == {
         "nested": {"a": 2}
     }
@@ -336,7 +402,6 @@ def test_extract_json_from_text_and_interaction_text() -> None:
     with pytest.raises(ValueError):
         extract_json_from_text("   ")
 
-    # Supports google-genai Interaction.steps structure
     steps_resp = SimpleNamespace(
         output_text="",
         steps=[
@@ -354,32 +419,90 @@ def test_extract_json_from_text_and_interaction_text() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_extract_motion_from_video_calls_hydrogen_with_invariants(tmp_path: Path) -> None:
+def test_extract_motion_from_video_uses_agentic_video_and_thinking_levels(tmp_path: Path) -> None:
     clip = tmp_path / "dance.mp4"
     clip.write_bytes(b"small-mp4-bytes")
 
     fenced_payload = f"```json\n{json.dumps(_sample_pose_sequence_dict())}\n```"
-    client = _FakeGenAIClient(responses=[SimpleNamespace(output_text=fenced_payload)])
+    client = _FakeGenAIClient(
+        responses=[
+            SimpleNamespace(output_text=fenced_payload),
+            SimpleNamespace(output_text=json.dumps(_sample_pose_sequence_dict())),
+        ],
+        file_states=[_FakeFileState.ACTIVE, _FakeFileState.ACTIVE],
+    )
 
+    # Default thinking_level="medium"
     seq = extract_motion_from_video(client, clip, skill_hint="disco wave")
-
     assert isinstance(seq, PoseSequence)
     assert len(seq.keyframes) == 2
     assert seq.impossible_elements[0].element == "jump"
 
-    assert len(client.interactions.calls) == 1
+    call0 = client.interactions.calls[0]
+    _assert_gemini4_invariants(call0, expected_model=MOTION_MODEL, expected_thinking="medium")
+    assert call0["response_format"] == {
+        "type": "text",
+        "mime_type": "application/json",
+        "schema": compact_json_schema_for_gemini(PoseSequence),
+    }
+    assert call0["input"][0] == {
+        "type": "video",
+        "uri": "https://files.example/v1/files/vid1",
+        "mime_type": "video/mp4",
+        "processing": "agentic",
+    }
+    assert "disco wave" in call0["input"][1]["text"]
+    assert "impossible_elements" in call0["input"][1]["text"]
+    assert client.files.uploads == [str(clip)]
+
+    # Explicit thinking_level="high"
+    extract_motion_from_video(client, clip, thinking_level="high")
+    call1 = client.interactions.calls[1]
+    _assert_gemini4_invariants(call1, expected_model=MOTION_MODEL, expected_thinking="high")
+    assert call1["input"][0]["processing"] == "agentic"
+
+
+def test_debug_trial_video_uses_agentic_video_and_high_thinking(tmp_path: Path) -> None:
+    clip = tmp_path / "trial_orange_justice.mp4"
+    clip.write_bytes(b"trial-recording-mp4")
+
+    expected_dict = _sample_debug_report_dict("dance_orange_justice")
+    client = _FakeGenAIClient(
+        responses=[SimpleNamespace(output_text=f"```json\n{json.dumps(expected_dict)}\n```")],
+        file_states=[_FakeFileState.ACTIVE],
+    )
+
+    report = debug_trial_video(
+        client,
+        clip,
+        skill_name="dance_orange_justice",
+        expected_behavior="Grounded rhythmic knee bounce with alternating diagonal arm claps.",
+    )
+
+    assert isinstance(report, dict)
+    assert report["skill_name"] == "dance_orange_justice"
+    assert report["succeeded"] is False
+    assert report["slip_detected"] is True
+    assert report["suspected_joints"] == ["r_ankle_roll", "r_hip_roll"]
+    assert report["observations"][0]["timestamp_ms"] == 820
+    assert len(report["recommended_fixes"]) == 1
+
     call = client.interactions.calls[0]
-    _assert_gemini4_invariants(call, expected_model=MOTION_MODEL, expected_thinking="medium")
+    _assert_gemini4_invariants(call, expected_model=MOTION_MODEL, expected_thinking="high")
+    assert call["input"][0] == {
+        "type": "video",
+        "uri": "https://files.example/v1/files/vid1",
+        "mime_type": "video/mp4",
+        "processing": "agentic",
+    }
     assert call["response_format"] == {
         "type": "text",
         "mime_type": "application/json",
-        "schema": PoseSequence.model_json_schema(),
+        "schema": compact_json_schema_for_gemini(TrialVideoDebugReport),
     }
-    assert call["input"][0]["type"] == "video"
-    assert "data" in call["input"][0]
-    assert call["input"][1]["type"] == "text"
-    assert "disco wave" in call["input"][1]["text"]
-    assert "impossible_elements" in call["input"][1]["text"]
+    assert "dance_orange_justice" in call["input"][1]["text"]
+    assert "diagonal arm claps" in call["input"][1]["text"]
+    assert client.files.uploads == [str(clip)]
 
 
 def test_extract_motion_from_description_calls_hydrogen_with_invariants() -> None:
@@ -396,7 +519,7 @@ def test_extract_motion_from_description_calls_hydrogen_with_invariants() -> Non
     assert call["response_format"] == {
         "type": "text",
         "mime_type": "application/json",
-        "schema": PoseSequence.model_json_schema(),
+        "schema": compact_json_schema_for_gemini(PoseSequence),
     }
     assert len(call["input"]) == 1
     assert "Robot disco arm wave with a hop" in call["input"][0]["text"]
@@ -405,7 +528,7 @@ def test_extract_motion_from_description_calls_hydrogen_with_invariants() -> Non
         extract_motion_from_description(client, "   ")
 
 
-def test_generate_baseline_raw_keyframes_object_and_video_modes(tmp_path: Path) -> None:
+def test_generate_baseline_raw_keyframes_object_and_agentic_video_modes(tmp_path: Path) -> None:
     clip = tmp_path / "ref.mp4"
     clip.write_bytes(b"mp4-content")
 
@@ -417,7 +540,8 @@ def test_generate_baseline_raw_keyframes_object_and_video_modes(tmp_path: Path) 
         responses=[
             SimpleNamespace(output_text=json.dumps({"keyframes": raw_frames})),
             SimpleNamespace(output_text=json.dumps(raw_frames)),
-        ]
+        ],
+        file_states=[_FakeFileState.ACTIVE],
     )
 
     frames_with_video = generate_baseline_raw_keyframes(client, "Wave hello", video_path=clip)
@@ -430,10 +554,15 @@ def test_generate_baseline_raw_keyframes_object_and_video_modes(tmp_path: Path) 
     assert call0["response_format"] == {
         "type": "text",
         "mime_type": "application/json",
-        "schema": BaselineKeyframesPayload.model_json_schema(),
+        "schema": compact_json_schema_for_gemini(BaselineKeyframesPayload),
     }
-    assert call0["input"][0]["type"] == "video"
-    assert call0["input"][1]["type"] == "text"
+    assert call0["input"][0] == {
+        "type": "video",
+        "uri": "https://files.example/v1/files/vid1",
+        "mime_type": "video/mp4",
+        "processing": "agentic",
+    }
+    assert client.files.uploads == [str(clip)]
 
     # Bare list response without video path also supported
     frames_text_only = generate_baseline_raw_keyframes(client, "Wave hello")
@@ -443,8 +572,13 @@ def test_generate_baseline_raw_keyframes_object_and_video_modes(tmp_path: Path) 
     assert len(call1["input"]) == 1
 
 
-def test_run_live_reflex_announcement_with_and_without_camera_frame() -> None:
-    status = RobotStatus(battery_v=11.5, max_servo_temp_c=40.2, torso_pitch_deg=1.2, torso_roll_deg=-0.5)
+def test_run_live_reflex_announcement_uses_medium_thinking() -> None:
+    status = RobotStatus(
+        battery_v=11.5,
+        max_servo_temp_c=40.2,
+        torso_pitch_deg=1.2,
+        torso_roll_deg=-0.5,
+    )
     jpeg_bytes = b"\xff\xd8\xff\xe0fake-jpeg-bytes\xff\xd9"
 
     verbose_reply = (
@@ -469,7 +603,7 @@ def test_run_live_reflex_announcement_with_and_without_camera_frame() -> None:
     assert len(line1.split()) <= MAX_ANNOUNCEMENT_WORDS
 
     call0 = client.interactions.calls[0]
-    _assert_gemini4_invariants(call0, expected_model=MOTION_MODEL, expected_thinking="low")
+    _assert_gemini4_invariants(call0, expected_model=MOTION_MODEL, expected_thinking="medium")
     assert call0["input"][0] == {
         "type": "image",
         "data": base64.b64encode(jpeg_bytes).decode("ascii"),
@@ -477,7 +611,6 @@ def test_run_live_reflex_announcement_with_and_without_camera_frame() -> None:
     }
     assert '"battery_v": 11.5' in call0["input"][1]["text"]
 
-    # Without camera frame, truncates verbose replies to <= 18 words cleanly
     line2 = run_live_reflex_announcement(
         client,
         skill_name="disco_wave",
@@ -538,7 +671,7 @@ def test_check_workspace_framing_calls_robotics_er2_and_parses_result() -> None:
     assert call0["response_format"] == {
         "type": "text",
         "mime_type": "application/json",
-        "schema": SpatialFramingResult.model_json_schema(),
+        "schema": compact_json_schema_for_gemini(SpatialFramingResult),
     }
     assert call0["input"][0] == {
         "type": "image",
@@ -554,12 +687,68 @@ def test_check_workspace_framing_calls_robotics_er2_and_parses_result() -> None:
         check_workspace_framing(client, b"")
 
 
+def test_compact_json_schema_for_gemini_strips_heavy_fsm_keywords() -> None:
+    """Verify response_format schemas strip FSM-bloating bounds while Pydantic stays strict."""
+    stripped_keywords = {
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+        "title",
+        "description",
+        "default",
+        "examples",
+    }
+
+    def _collect_keys(node: Any) -> set[str]:
+        found: set[str] = set()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                found.add(k)
+                found.update(_collect_keys(v))
+        elif isinstance(node, list):
+            for item in node:
+                found.update(_collect_keys(item))
+        return found
+
+    for cls in (
+        PoseSequence,
+        TrialVideoDebugReport,
+        BaselineKeyframesPayload,
+        SpatialFramingResult,
+    ):
+        raw_keys = _collect_keys(cls.model_json_schema())
+        compact = compact_json_schema_for_gemini(cls)
+        compact_keys = _collect_keys(compact)
+
+        assert raw_keys & stripped_keywords, f"Expected raw {cls.__name__} schema to have metadata/bounds"
+        assert not (compact_keys & stripped_keywords), (
+            f"Heavy FSM keywords remained in compact {cls.__name__} schema: "
+            f"{sorted(compact_keys & stripped_keywords)}"
+        )
+        assert compact["type"] == "object"
+        assert "properties" in compact
+        assert "required" in compact
+        genai_interactions.TextResponseFormat.model_validate(
+            {"type": "text", "mime_type": "application/json", "schema": compact}
+        )
+
+    # Local Pydantic validation still enforces strict numeric bounds on PoseSequence.
+    out_of_range = _sample_pose_sequence_dict()
+    out_of_range["keyframes"][0]["torso_pitch_deg"] = 145.0
+    with pytest.raises(ValueError, match="less than or equal to 90"):
+        PoseSequence.model_validate_json(json.dumps(out_of_range))
+
+
 def test_sdk_normalize_create_body_accepts_all_request_payloads(tmp_path: Path) -> None:
     """Verify every kwargs dict emitted by our modules is accepted by google-genai 3.6.1."""
-    from google import genai as real_genai
-
-    real_client = real_genai.Client(api_key="dummy-key", http_options={"api_version": "v1beta"})
-    normalize_fn = real_client.interactions.create.__globals__["_normalize_create_body"]
+    real_v1 = make_v1_client("dummy-key")
+    normalize_fn = real_v1.interactions.create.__globals__["_normalize_create_body"]
 
     clip = tmp_path / "mini.mp4"
     clip.write_bytes(b"mini-mp4")
@@ -569,6 +758,7 @@ def test_sdk_normalize_create_body_accepts_all_request_payloads(tmp_path: Path) 
     client = _FakeGenAIClient(
         responses=[
             SimpleNamespace(output_text=json.dumps(_sample_pose_sequence_dict())),
+            SimpleNamespace(output_text=json.dumps(_sample_debug_report_dict("mini"))),
             SimpleNamespace(output_text=json.dumps(_sample_pose_sequence_dict())),
             SimpleNamespace(
                 output_text=json.dumps(
@@ -587,17 +777,23 @@ def test_sdk_normalize_create_body_accepts_all_request_payloads(tmp_path: Path) 
                     }
                 )
             ),
-        ]
+        ],
+        file_states=[_FakeFileState.ACTIVE, _FakeFileState.ACTIVE],
     )
 
     extract_motion_from_video(client, clip)
+    debug_trial_video(client, clip, skill_name="mini", expected_behavior="Wave smoothly")
     extract_motion_from_description(client, "Wave both arms")
     generate_baseline_raw_keyframes(client, "Wave both arms")
     run_live_reflex_announcement(client, "wave", "Wave arms", status, frame_jpeg=jpeg)
     check_workspace_framing(client, jpeg)
 
-    assert len(client.interactions.calls) == 5
+    assert len(client.interactions.calls) == 6
     for call_kwargs in client.interactions.calls:
         normalized = normalize_fn(call_kwargs)
         assert normalized["model"] in {MOTION_MODEL, SPATIAL_MODEL}
         assert isinstance(normalized["input"], list)
+        for item in call_kwargs["input"]:
+            if item.get("type") == "video":
+                assert item["processing"] == "agentic"
+                genai_interactions.VideoContent.model_validate(item)

@@ -1,4 +1,9 @@
-"""Multimodal 0-output-token safety, feasibility, and fidelity gate via gemini-decision-1."""
+"""Multimodal 0-output-token safety, feasibility, and fidelity gate via gemini-decision-1.
+
+All Decisions API calls run on the ``v1beta`` client (`beta_client.decisions.create`).
+Auto-branching into execution routes (`execute_and_save`, `adapt_upper_body_only`)
+strictly requires BOTH `confidence >= 0.75` AND `is_physically_safe.noul >= 0.75`.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ from typing import Any, Final, cast
 from roboharness.config import (
     DECISION_CONFIDENCE_THRESHOLD,
     DECISION_MODEL,
+    DECISION_SAFETY_PROB_THRESHOLD,
     MAX_SERVO_TEMP_C,
     MAX_TORSO_TILT_DEG,
     MIN_BATTERY_V,
@@ -35,6 +41,13 @@ VALID_ROUTES: Final[frozenset[str]] = frozenset(
         "repair_in_forge",
         "refuse_impossible",
         "other",
+    }
+)
+
+_EXECUTION_ROUTES: Final[frozenset[str]] = frozenset(
+    {
+        "execute_and_save",
+        "adapt_upper_body_only",
     }
 )
 
@@ -347,28 +360,27 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
 
 
-def _choose_safe_downgrade(
-    is_physically_safe_prob: float,
-    route_probabilities: dict[str, float],
-) -> EffectiveAction:
-    """Choose between repair_in_forge and refuse_impossible when safety overrides execution."""
-    refuse_p = float(route_probabilities.get("refuse_impossible", 0.0))
-    repair_p = float(route_probabilities.get("repair_in_forge", 0.0))
-    if refuse_p > repair_p:
-        return "refuse_impossible"
-    if repair_p > refuse_p:
-        return "repair_in_forge"
-    if is_physically_safe_prob < 0.25:
-        return "refuse_impossible"
-    return "repair_in_forge"
-
-
 def parse_decision_response(
     response: Any,
     *,
     confidence_threshold: float = DECISION_CONFIDENCE_THRESHOLD,
+    safety_prob_threshold: float = DECISION_SAFETY_PROB_THRESHOLD,
 ) -> DecisionGateResult:
-    """Parse a CreateDecisionResponse (SDK model or dict) and enforce confidence/safety gates."""
+    """Parse a CreateDecisionResponse (SDK model or dict) and enforce confidence/safety gates.
+
+    Auto-branching rules (Gemini 4 Builder Guide Adjustment #4):
+    - Whenever `route_conf < confidence_threshold` OR `is_physically_safe_conf < confidence_threshold`
+      OR `route == "other"`: `auto_branch_allowed = False`, `effective_action = "escalate_human"`.
+    - For execution routes (`execute_and_save`, `adapt_upper_body_only`):
+      auto-branching requires BOTH confidence >= `confidence_threshold` (0.75) AND
+      `is_physically_safe.noul >= safety_prob_threshold` (0.75). When safety probability is
+      below `safety_prob_threshold` (with sufficient confidence), escalates safely to
+      `refuse_impossible` if `is_physically_safe.noul < 0.25`, else `repair_in_forge`,
+      with `auto_branch_allowed = False`.
+    - For non-execution routes (`refuse_impossible`, `repair_in_forge`):
+      auto-branching requires `route_conf >= confidence_threshold` and
+      `is_physically_safe_conf >= confidence_threshold`.
+    """
     answers = _get_attr_or_key(response, "answers")
     if answers is None or not isinstance(answers, Mapping):
         raise ValueError("Decisions API response missing 'answers' mapping")
@@ -415,16 +427,16 @@ def parse_decision_response(
     if not meets_confidence or route == "other":
         auto_branch_allowed = False
         effective_action: EffectiveAction = "escalate_human"
+    elif route in _EXECUTION_ROUTES:
+        if safe_prob >= safety_prob_threshold:
+            auto_branch_allowed = True
+            effective_action = cast(EffectiveAction, route)
+        else:
+            auto_branch_allowed = False
+            effective_action = "refuse_impossible" if safe_prob < 0.25 else "repair_in_forge"
     else:
         auto_branch_allowed = True
-        needs_safety_downgrade = safe_prob < 0.50 and (
-            route == "execute_and_save"
-            or (route == "adapt_upper_body_only" and adapt_prob < 0.50)
-        )
-        if needs_safety_downgrade:
-            effective_action = _choose_safe_downgrade(safe_prob, route_probabilities)
-        else:
-            effective_action = cast(EffectiveAction, route)
+        effective_action = cast(EffectiveAction, route)
 
     raw_answers = {key: _to_jsonable_answer(answers[key]) for key in answers}
 
@@ -447,16 +459,17 @@ def parse_decision_response(
 
 
 def evaluate_pre_execution(
-    client: Any,
+    beta_client: Any,
     skill: SkillArtifact,
     pose_seq: PoseSequence | None,
     frame_jpegs: list[bytes],
     robot_status: RobotStatus,
     *,
     confidence_threshold: float = DECISION_CONFIDENCE_THRESHOLD,
+    safety_prob_threshold: float = DECISION_SAFETY_PROB_THRESHOLD,
     extra_context: dict[str, Any] | None = None,
 ) -> DecisionGateResult:
-    """Evaluate candidate skill before actuation in one 0-output-token Decisions API call."""
+    """Evaluate candidate skill before actuation in one 0-output-token v1beta Decisions call."""
     decision_input = build_decision_input(
         skill=skill,
         pose_seq=pose_seq,
@@ -464,24 +477,29 @@ def evaluate_pre_execution(
         robot_status=robot_status,
         extra_context=extra_context,
     )
-    response = client.decisions.create(
+    response = beta_client.decisions.create(
         model=DECISION_MODEL,
         input=decision_input,
         questions=PRE_EXECUTION_QUESTIONS,
     )
-    return parse_decision_response(response, confidence_threshold=confidence_threshold)
+    return parse_decision_response(
+        response,
+        confidence_threshold=confidence_threshold,
+        safety_prob_threshold=safety_prob_threshold,
+    )
 
 
 def evaluate_post_run(
-    client: Any,
+    beta_client: Any,
     skill: SkillArtifact,
     reference_jpegs: list[bytes],
     post_run_jpeg: bytes | None,
     final_status: RobotStatus,
     *,
     confidence_threshold: float = DECISION_CONFIDENCE_THRESHOLD,
+    safety_prob_threshold: float = DECISION_SAFETY_PROB_THRESHOLD,
 ) -> DecisionGateResult:
-    """Evaluate observed post-run camera frame and final IMU telemetry via gemini-decision-1."""
+    """Evaluate observed post-run camera frame and final IMU telemetry via v1beta Decisions API."""
     has_post_run = bool(post_run_jpeg)
     if has_post_run and post_run_jpeg is not None:
         selected_refs = _select_frames(reference_jpegs, MAX_DECISION_FRAMES - 1)
@@ -508,24 +526,29 @@ def evaluate_post_run(
         robot_status=final_status,
         extra_context=post_run_context,
     )
-    response = client.decisions.create(
+    response = beta_client.decisions.create(
         model=DECISION_MODEL,
         input=decision_input,
         questions=POST_RUN_QUESTIONS,
     )
-    return parse_decision_response(response, confidence_threshold=confidence_threshold)
+    return parse_decision_response(
+        response,
+        confidence_threshold=confidence_threshold,
+        safety_prob_threshold=safety_prob_threshold,
+    )
 
 
 def evaluate_baseline_skill(
-    client: Any,
+    beta_client: Any,
     skill: SkillArtifact,
     scenario_description: str,
     robot_status: RobotStatus,
     *,
     frame_jpegs: list[bytes] | None = None,
     confidence_threshold: float = DECISION_CONFIDENCE_THRESHOLD,
+    safety_prob_threshold: float = DECISION_SAFETY_PROB_THRESHOLD,
 ) -> DecisionGateResult:
-    """Score a benchmark skill (Baseline A or Full RoboHarness) on the exact same rubric."""
+    """Score a benchmark skill (Baseline A or Full RoboHarness) on the exact same v1beta rubric."""
     decision_input = build_decision_input(
         skill=skill,
         pose_seq=None,
@@ -536,9 +559,13 @@ def evaluate_baseline_skill(
             "scenario_description": scenario_description,
         },
     )
-    response = client.decisions.create(
+    response = beta_client.decisions.create(
         model=DECISION_MODEL,
         input=decision_input,
         questions=PRE_EXECUTION_QUESTIONS,
     )
-    return parse_decision_response(response, confidence_threshold=confidence_threshold)
+    return parse_decision_response(
+        response,
+        confidence_threshold=confidence_threshold,
+        safety_prob_threshold=safety_prob_threshold,
+    )

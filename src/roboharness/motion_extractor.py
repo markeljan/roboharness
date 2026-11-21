@@ -1,4 +1,4 @@
-"""Motion extraction, single-shot baseline generation, and live reflex speech via gemini-4-hydrogen."""
+"""Motion extraction, agentic video debugging, baseline generation, and reflex speech via gemini-4-hydrogen."""
 
 from __future__ import annotations
 
@@ -6,16 +6,17 @@ import base64
 import json
 import re
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, Field
 
 from roboharness.config import MOTION_MODEL
-from roboharness.genai_client import (
+from roboharness.models import (
     build_gemini4_generation_config,
+    compact_json_schema_for_gemini,
     extract_interaction_text,
     extract_json_from_text,
-    prepare_video_input,
+    upload_video_agentic,
 )
 from roboharness.schemas import (
     TONYPI_JOINTS,
@@ -39,9 +40,37 @@ class BaselineKeyframesPayload(BaseModel):
     keyframes: list[ServoKeyframe] = Field(min_length=1, max_length=32)
 
 
+class TrialVideoObservation(BaseModel):
+    """Timestamped limb/table observation produced by Agentic Video Processing."""
+
+    timestamp_ms: int = Field(ge=0, description="Timestamp in milliseconds of observed event.")
+    limb_or_region: str = Field(
+        description="Body part or workspace region zoomed into (e.g. 'r_ankle', 'torso', 'table_edge')."
+    )
+    observation: str = Field(description="Visual finding at this timestamp.")
+    severity: Literal["info", "warning", "failure"] = "info"
+
+
+class TrialVideoDebugReport(BaseModel):
+    """Structured post-trial failure & slip diagnosis from Agentic Video Processing."""
+
+    skill_name: str
+    succeeded: bool = Field(
+        description="Whether the robot visually completed the expected move stably."
+    )
+    root_cause: str = Field(
+        description="Concise diagnosis of any slip, tilt, limb clipping, or tracking error."
+    )
+    slip_detected: bool = False
+    suspected_joints: list[str] = Field(default_factory=list)
+    observations: list[TrialVideoObservation] = Field(default_factory=list)
+    recommended_fixes: list[str] = Field(default_factory=list)
+
+
 def _pose_extraction_prompt(*, skill_hint: str = "", description: str | None = None) -> str:
     source_clause = (
-        "Analyze the attached human dance or gesture video."
+        "Analyze the attached human dance or gesture video using agentic timestamp scrubbing "
+        "and limb inspection."
         if description is None
         else f"Synthesize a realistic human motion sequence for this requested dance/gesture:\n{description.strip()}"
     )
@@ -77,23 +106,71 @@ def extract_motion_from_video(
     video_path: Path,
     *,
     skill_hint: str = "",
+    thinking_level: str = "medium",
 ) -> PoseSequence:
-    """Extract a beat-synced ``PoseSequence`` from a human reference video."""
-    video_part = prepare_video_input(client, video_path)
+    """Extract a beat-synced ``PoseSequence`` from a reference video via Agentic Video Processing."""
+    video_part = upload_video_agentic(client, video_path)
     prompt = _pose_extraction_prompt(skill_hint=skill_hint)
 
     interaction = client.interactions.create(
         model=MOTION_MODEL,
         input=[video_part, {"type": "text", "text": prompt}],
-        generation_config=build_gemini4_generation_config("medium"),
+        generation_config=build_gemini4_generation_config(thinking_level),
         response_format={
             "type": "text",
             "mime_type": "application/json",
-            "schema": PoseSequence.model_json_schema(),
+            "schema": compact_json_schema_for_gemini(PoseSequence),
         },
     )
     raw_text = extract_interaction_text(interaction)
     return PoseSequence.model_validate_json(extract_json_from_text(raw_text))
+
+
+def debug_trial_video(
+    client: Any,
+    video_path: Path,
+    *,
+    skill_name: str,
+    expected_behavior: str = "",
+    thinking_level: str = "high",
+) -> dict[str, Any]:
+    """Diagnose a robot trial recording via Agentic Video Processing (``processing="agentic"``).
+
+    Uploads the recorded trial video via the Files API with ``processing="agentic"`` and
+    ``thinking_level="high"`` so Gemini can scrub timestamps and zoom into individual limbs,
+    feet, and table edges to pinpoint slips, tipping, or joint-limit deviations.
+    """
+    video_part = upload_video_agentic(client, video_path)
+    expected_clause = (
+        f"Expected robot behavior: {expected_behavior.strip()}\n"
+        if expected_behavior.strip()
+        else ""
+    )
+    prompt = (
+        "Inspect this Hiwonder TonyPi tabletop robot trial recording using agentic video "
+        "timestamp scrubbing and close-up limb inspection.\n"
+        f"Skill name: {skill_name}\n"
+        f"{expected_clause}\n"
+        "Output ONLY valid JSON matching the TrialVideoDebugReport schema:\n"
+        "- Identify exact timestamps (ms) where feet slip, torso tilts excessively, arms clip "
+        "or collide, or motion lags behind the intended choreography.\n"
+        "- Populate `suspected_joints` using canonical TonyPi joint names when relevant.\n"
+        "- Provide concrete, actionable `recommended_fixes` for the next Managed Agent forge pass."
+    )
+
+    interaction = client.interactions.create(
+        model=MOTION_MODEL,
+        input=[video_part, {"type": "text", "text": prompt}],
+        generation_config=build_gemini4_generation_config(thinking_level),
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": compact_json_schema_for_gemini(TrialVideoDebugReport),
+        },
+    )
+    raw_text = extract_interaction_text(interaction)
+    report = TrialVideoDebugReport.model_validate_json(extract_json_from_text(raw_text))
+    return report.model_dump(mode="json")
 
 
 def extract_motion_from_description(
@@ -112,7 +189,7 @@ def extract_motion_from_description(
         response_format={
             "type": "text",
             "mime_type": "application/json",
-            "schema": PoseSequence.model_json_schema(),
+            "schema": compact_json_schema_for_gemini(PoseSequence),
         },
     )
     raw_text = extract_interaction_text(interaction)
@@ -143,7 +220,7 @@ def generate_baseline_raw_keyframes(
 
     input_parts: list[dict[str, Any]] = []
     if video_path is not None:
-        input_parts.append(prepare_video_input(client, video_path))
+        input_parts.append(upload_video_agentic(client, video_path))
     input_parts.append({"type": "text", "text": prompt})
 
     interaction = client.interactions.create(
@@ -153,7 +230,7 @@ def generate_baseline_raw_keyframes(
         response_format={
             "type": "text",
             "mime_type": "application/json",
-            "schema": BaselineKeyframesPayload.model_json_schema(),
+            "schema": compact_json_schema_for_gemini(BaselineKeyframesPayload),
         },
     )
     raw_text = extract_interaction_text(interaction)
@@ -210,7 +287,7 @@ def run_live_reflex_announcement(
     interaction = client.interactions.create(
         model=MOTION_MODEL,
         input=input_parts,
-        generation_config=build_gemini4_generation_config("low"),
+        generation_config=build_gemini4_generation_config("medium"),
     )
     raw_text = extract_interaction_text(interaction)
     return _sanitize_announcement(raw_text)

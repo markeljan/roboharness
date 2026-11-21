@@ -16,6 +16,8 @@ from roboharness.config import (
     FORBIDDEN_GEMINI4_PARAMS,
     FORGE_AGENT_ID,
     FORGE_BASE_AGENT,
+    FORGE_DEEP_AGENT_ID,
+    FORGE_DEEP_MODEL,
     FORGE_MODEL,
     REMOTE_MCP_NAME,
     RESERVED_AGENT_ID_PREFIXES,
@@ -29,6 +31,7 @@ from roboharness.managed_forge import (
     ensure_forge_agent,
     extract_json_object,
     forge_skill,
+    forge_skill_with_escalation,
     load_bundle_inline_sources,
     validate_agent_id,
     validate_mcp_tool_name,
@@ -108,27 +111,31 @@ def _sample_pose_sequence(*, with_jump: bool = False) -> PoseSequence:
 
 
 class _FakeAgentsAPI:
-    def __init__(self, existing: Any = None) -> None:
-        self.existing = existing
+    def __init__(self, existing: Any = None, *, existing_by_id: dict[str, Any] | None = None) -> None:
+        self.existing_by_id: dict[str, Any] = dict(existing_by_id or {})
+        if existing is not None:
+            key = getattr(existing, "id", FORGE_AGENT_ID)
+            self.existing_by_id[key] = existing
         self.get_calls: list[dict[str, Any]] = []
         self.create_calls: list[dict[str, Any]] = []
         self.delete_calls: list[dict[str, Any]] = []
 
     def get(self, *, id: str) -> Any:
         self.get_calls.append({"id": id})
-        if self.existing is None:
+        if id not in self.existing_by_id:
             raise KeyError(f"Agent '{id}' not found")
-        return self.existing
+        return self.existing_by_id[id]
 
     def delete(self, *, id: str) -> dict[str, Any]:
         self.delete_calls.append({"id": id})
-        self.existing = None
+        self.existing_by_id.pop(id, None)
         return {}
 
     def create(self, **kwargs: Any) -> Any:
         self.create_calls.append(kwargs)
-        self.existing = SimpleNamespace(**kwargs)
-        return self.existing
+        agent = SimpleNamespace(**kwargs)
+        self.existing_by_id[kwargs["id"]] = agent
+        return agent
 
 
 class _FakeInteractionsAPI:
@@ -155,10 +162,11 @@ class _FakeGenAIClient:
         self,
         *,
         existing_agent: Any = None,
+        existing_by_id: dict[str, Any] | None = None,
         interaction_responses: list[Any] | None = None,
         poll_responses: dict[str, list[Any]] | None = None,
     ) -> None:
-        self.agents = _FakeAgentsAPI(existing=existing_agent)
+        self.agents = _FakeAgentsAPI(existing=existing_agent, existing_by_id=existing_by_id)
         self.interactions = _FakeInteractionsAPI(
             interaction_responses or [],
             poll_responses=poll_responses,
@@ -636,3 +644,166 @@ def test_deterministic_retarget_fallback_grounded_and_jump_adaptation() -> None:
     assert adapted.kinematics.joint_clipping_count == 0
     assert adapted.kinematics.peak_torso_tilt_deg < 30.0
     assert verify_artifact_signature(adapted) is True
+
+
+# ---------------------------------------------------------------------------
+# Builder Guide Adjustment #3: GEMINI_ENVIRONMENT_ID & Neon -> Carbon escalation
+# ---------------------------------------------------------------------------
+
+
+def test_self_hosted_gemini_environment_id_omits_sources_and_allowlist(tmp_path: Path) -> None:
+    forge_payload = {
+        "refused": False,
+        "name": "mujoco_wave",
+        "keyframes": [
+            {
+                "duration_ms": 450,
+                "servos": {**NEUTRAL_POSE, "r_shoulder_pitch": 620},
+                "note": "beat 0",
+            }
+        ],
+    }
+    resp = SimpleNamespace(
+        id="inter_self_hosted",
+        status="completed",
+        environment_id="env_docker_mujoco_99",
+        output_text=json.dumps(forge_payload),
+    )
+    client = _FakeGenAIClient(existing_agent=None, interaction_responses=[resp])
+    settings = RoboHarnessSettings(
+        gemini_environment_id="env_docker_mujoco_99",
+        forge_state_path=tmp_path / "state.json",
+    )
+
+    state = ensure_forge_agent(client, settings, poll_interval_sec=0.0)
+    assert state.base_environment_id == "env_docker_mujoco_99"
+    assert state.created_now is True
+    # Must NOT run hosted bootstrap with inline sources when GEMINI_ENVIRONMENT_ID is set
+    assert len(client.interactions.create_calls) == 0
+    create_call = client.agents.create_calls[0]
+    assert create_call["base_environment"] == "env_docker_mujoco_99"
+    assert "sources" not in json.dumps(create_call)
+    assert "allowlist" not in json.dumps(create_call)
+    assert "max_total_tokens" not in create_call["agent_config"]
+
+    result = forge_skill(client, settings, _sample_pose_sequence(), "mujoco_wave", poll_interval_sec=0.0)
+    assert result.artifact is not None and result.artifact.kinematics.verified is True
+    inter_call = client.interactions.create_calls[0]
+    assert inter_call["environment"] == "env_docker_mujoco_99"
+    assert "sources" not in json.dumps(inter_call)
+    assert "allowlist" not in json.dumps(inter_call)
+
+
+def test_forge_escalation_from_neon_to_carbon_after_two_failures(tmp_path: Path) -> None:
+    clipped_payload = {
+        "refused": False,
+        "name": "hard_lunge",
+        "keyframes": [
+            {
+                "duration_ms": 450,
+                "servos": {**NEUTRAL_POSE, "r_shoulder_pitch": 950},
+                "note": "clipped",
+            }
+        ],
+    }
+    clean_payload = {
+        "refused": False,
+        "name": "hard_lunge",
+        "adaptation_mode": "upper_body_adapted",
+        "lower_body_adapted": True,
+        "keyframes": [
+            {
+                "duration_ms": 450,
+                "servos": {**NEUTRAL_POSE, "r_shoulder_pitch": 680},
+                "note": "carbon_fixed",
+            }
+        ],
+    }
+    neon_agent = SimpleNamespace(
+        id=FORGE_AGENT_ID,
+        base_environment="env_neon",
+        agent_config={"type": "antigravity", "model": FORGE_MODEL},
+    )
+    carbon_agent = SimpleNamespace(
+        id=FORGE_DEEP_AGENT_ID,
+        base_environment="env_carbon",
+        agent_config={"type": "antigravity", "model": FORGE_DEEP_MODEL},
+    )
+    client = _FakeGenAIClient(
+        existing_by_id={FORGE_AGENT_ID: neon_agent, FORGE_DEEP_AGENT_ID: carbon_agent},
+        interaction_responses=[
+            SimpleNamespace(id="i1", status="completed", environment_id="e1", output_text=json.dumps(clipped_payload)),
+            SimpleNamespace(id="i2", status="completed", environment_id="e2", output_text=json.dumps(clipped_payload)),
+            SimpleNamespace(id="i3", status="completed", environment_id="e3", output_text=json.dumps(clean_payload)),
+        ],
+    )
+    settings = RoboHarnessSettings(forge_state_path=tmp_path / "state.json")
+
+    res = forge_skill_with_escalation(
+        client,
+        settings,
+        _sample_pose_sequence(),
+        "hard_lunge",
+        poll_interval_sec=0.0,
+    )
+    assert res.escalated_to_carbon is True
+    assert res.model_used == FORGE_DEEP_MODEL == "gemini-4-carbon"
+    assert res.artifact is not None
+    assert res.artifact.kinematics.verified is True
+    assert verify_artifact_signature(res.artifact) is True
+
+    # Two Neon calls followed by Carbon escalation carrying violation diagnostics
+    agents_called = [c["agent"] for c in client.interactions.create_calls]
+    assert agents_called == [FORGE_AGENT_ID, FORGE_AGENT_ID, FORGE_DEEP_AGENT_ID]
+    assert "ESCALATED TO gemini-4-carbon" in client.interactions.create_calls[2]["input"]
+    assert "r_shoulder_pitch=950" in client.interactions.create_calls[2]["input"]
+
+
+def test_forge_deep_flag_routes_directly_to_carbon(tmp_path: Path) -> None:
+    clean_payload = {
+        "refused": False,
+        "name": "deep_move",
+        "keyframes": [
+            {
+                "duration_ms": 450,
+                "servos": {**NEUTRAL_POSE, "r_shoulder_pitch": 640},
+                "note": "carbon_direct",
+            }
+        ],
+    }
+    bootstrap_resp = SimpleNamespace(
+        id="boot_carbon",
+        status="completed",
+        environment_id="env_carbon_fork",
+        output_text='{"self_test": "ok"}',
+    )
+    forge_resp = SimpleNamespace(
+        id="inter_carbon_direct",
+        status="completed",
+        environment_id="env_carbon_run",
+        output_text=json.dumps(clean_payload),
+    )
+    client = _FakeGenAIClient(
+        existing_agent=None,
+        interaction_responses=[bootstrap_resp, forge_resp],
+    )
+    settings = RoboHarnessSettings(forge_state_path=tmp_path / "state.json")
+
+    res = forge_skill_with_escalation(
+        client,
+        settings,
+        _sample_pose_sequence(),
+        "deep_move",
+        deep=True,
+        poll_interval_sec=0.0,
+    )
+    assert res.escalated_to_carbon is True
+    assert res.model_used == "gemini-4-carbon"
+    assert res.artifact is not None and res.artifact.kinematics.verified is True
+
+    # Created Carbon agent locked to gemini-4-carbon without reserved prefix or token cap
+    create_call = client.agents.create_calls[0]
+    assert create_call["id"] == "roboharness-skill-forge-carbon"
+    assert not create_call["id"].startswith(RESERVED_AGENT_ID_PREFIXES)
+    assert create_call["agent_config"] == {"type": "antigravity", "model": "gemini-4-carbon"}
+    assert client.interactions.create_calls[1]["agent"] == "roboharness-skill-forge-carbon"

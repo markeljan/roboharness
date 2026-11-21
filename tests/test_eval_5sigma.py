@@ -23,13 +23,23 @@ from benchmarks.eval_5sigma import (
     select_scenarios,
 )
 from benchmarks.scenarios import SCENARIOS
+from roboharness import config as robo_config
 from roboharness.config import RoboHarnessSettings
 from roboharness.managed_forge import (
     ForgeAgentState,
     ForgeResult,
     deterministic_retarget_fallback,
 )
+from roboharness.models import DualGenAIClients
 from roboharness.schemas import DecisionGateResult
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_repo_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent offline benchmark tests from ever loading repo .env or hitting live APIs."""
+    monkeypatch.setattr(robo_config, "load_dotenv_if_present", lambda env_path=None: None)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
 
 
 def _make_gate(
@@ -42,7 +52,19 @@ def _make_gate(
     route_conf: float = 0.91,
 ) -> DecisionGateResult:
     min_conf = min(safe_conf, route_conf)
-    action = effective_action or (route if min_conf >= 0.70 and route != "other" else "escalate_human")
+    if effective_action is not None:
+        action = effective_action
+    elif min_conf < 0.75 or route == "other":
+        action = "escalate_human"
+    elif route in {"execute_and_save", "adapt_upper_body_only"} and safe_prob < 0.75:
+        action = "refuse_impossible" if safe_prob < 0.25 else "repair_in_forge"
+    else:
+        action = route
+    auto_ok = (
+        min_conf >= 0.75
+        and route != "other"
+        and (route not in {"execute_and_save", "adapt_upper_body_only"} or safe_prob >= 0.75)
+    )
     return DecisionGateResult(
         is_physically_safe_prob=safe_prob,
         is_physically_safe_conf=safe_conf,
@@ -55,7 +77,7 @@ def _make_gate(
         route_probabilities={route: route_conf},
         route_conf=route_conf,
         min_confidence=min_conf,
-        auto_branch_allowed=min_conf >= 0.70 and route != "other",
+        auto_branch_allowed=auto_ok,
         effective_action=action,  # type: ignore[arg-type]
     )
 
@@ -83,7 +105,6 @@ def test_offline_12_scenario_end_to_end_and_report_generation(tmp_path: Path) ->
     assert md_out.is_file()
     assert json_out.is_file()
 
-    # Validate structured JSON report
     raw_json = json_out.read_text(encoding="utf-8")
     parsed_dict = json.loads(raw_json)
     assert parsed_dict["mode"] == "offline"
@@ -93,7 +114,6 @@ def test_offline_12_scenario_end_to_end_and_report_generation(tmp_path: Path) ->
     bm = report.baseline_metrics
     rm = report.roboharness_metrics
 
-    # Full RoboHarness strictly dominates Baseline A across core 5-Sigma safety metrics
     assert rm.total_scenarios == 12
     assert rm.safety_pass_rate == 1.0
     assert bm.safety_pass_rate < 0.5
@@ -116,37 +136,37 @@ def test_offline_12_scenario_end_to_end_and_report_generation(tmp_path: Path) ->
     assert rm.mean_fidelity_score > bm.mean_fidelity_score
     assert rm.decisions_output_tokens == 0
 
-    # Impossible scenarios never move servos on Full RoboHarness
     for comp in report.comparisons:
         if comp.expect_refusal:
             assert comp.roboharness.status == "refused_safe"
             assert comp.roboharness.servos_moved is False
             assert comp.baseline.attempted_impossible is True
 
-    # Validate PROOF_IT_WORKS.md sections, all 12 scenario IDs, and Honest Failure Ledger
     md_text = md_out.read_text(encoding="utf-8")
     for required_section in (
         "# PROOF IT WORKS — RoboHarness 5 Sigma Evaluation",
+        "`>= 0.75` conf & `>= 0.75` safety",
         "## Executive Summary",
         "Physical Safety Pass Rate",
         "Zero-Clipping Rate",
         "Impossible-Move Safe Refusal Rate",
         "Sim-to-Real Table Slip Survival / Detection",
-        "Decisions API Output Tokens",
+        "Managed Forge Carbon Escalations (`gemini-4-carbon`)",
+        "Decisions API Output Tokens (`v1beta`)",
         "## 12-Scenario Comparison",
         "## Honest Failure Ledger",
         "### 1. Execution & Safety Failures",
         "### 2. Sim-to-Real Table Slip Stress (`1.45x` Multiplier)",
-        "### 3. Borderline Confidence Escalations (`< 0.70`)",
+        "### 3. Borderline Confidence Escalations (`< 0.75`)",
         "### 4. Fidelity Ceilings on Adapted & Impossible Moves",
         "## Reproducibility",
+        "--mode live --deep",
     ):
         assert required_section in md_text, f"Missing markdown section: {required_section}"
 
     for scenario in SCENARIOS:
         assert f"`{scenario.id}`" in md_text
 
-    # Failure ledger explicitly includes all 4 required categories
     ledger_categories = {entry.category for entry in report.failure_ledger}
     assert ledger_categories == {
         "execution_failure",
@@ -171,27 +191,66 @@ def test_scenario_selection_limit_and_subset() -> None:
         select_scenarios(scenario_ids=["nonexistent_move"])
 
 
-def test_live_mode_orchestration_repair_escalation_and_error_isolation(
+def test_live_mode_fails_loudly_without_api_key_zero_mocked_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    empty_settings = RoboHarnessSettings(gemini_api_key=None)
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+        run_benchmark(mode="live", limit=1, settings=empty_settings, quiet=True)
+
+    # CLI main() exits non-zero cleanly and writes NO fake report when API key is missing
+    monkeypatch.setattr(RoboHarnessSettings, "from_env", classmethod(lambda cls: empty_settings))
+    md_out = tmp_path / "SHOULD_NOT_EXIST.md"
+    json_out = tmp_path / "SHOULD_NOT_EXIST.json"
+    code = main(
+        [
+            "--mode",
+            "live",
+            "--limit",
+            "1",
+            "--output",
+            str(md_out),
+            "--json-out",
+            str(json_out),
+        ]
+    )
+    assert code == 1
+    assert not md_out.exists()
+    assert not json_out.exists()
+    assert "GEMINI_API_KEY" in capsys.readouterr().err
+
+
+def test_live_mode_dual_client_routing_carbon_escalation_and_error_isolation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise --mode live code path with stubbed Gemini calls (zero network)."""
+    """Exercise --mode live dual-client split (v1 vs v1beta), --deep/Carbon escalation, and errors."""
     import benchmarks.eval_5sigma as eval_mod
+
+    v1_sentinel = object()
+    v1beta_sentinel = object()
+    dual = DualGenAIClients(client=v1_sentinel, beta_client=v1beta_sentinel)
 
     forge_calls: dict[str, int] = {}
     post_run_calls: list[str] = []
+    seen_deep_flags: list[bool] = []
 
-    monkeypatch.setattr(
-        eval_mod,
-        "ensure_forge_agent",
-        lambda client, settings: ForgeAgentState(
-            agent_id=settings.managed_agent_id,
+    def _fake_ensure(beta_client: Any, settings: RoboHarnessSettings, *, deep: bool = False) -> Any:
+        assert beta_client is v1beta_sentinel
+        seen_deep_flags.append(deep)
+        return ForgeAgentState(
+            agent_id=settings.forge_deep_agent_id if deep else settings.managed_agent_id,
             base_environment_id="env-fork-123",
-            model=settings.forge_model,
+            model=settings.forge_deep_model if deep else settings.forge_model,
             created_now=False,
-        ),
-    )
+        )
 
-    def _fake_baseline(client: Any, description: str) -> list[Any]:
+    def _fake_baseline(v1_client: Any, description: str) -> list[Any]:
+        assert v1_client is v1_sentinel
         for s in SCENARIOS:
             if s.description == description:
                 if s.id == "dance_floss":
@@ -199,19 +258,24 @@ def test_live_mode_orchestration_repair_escalation_and_error_isolation(
                 return list(s.offline_baseline_raw_keyframes)
         raise AssertionError("Unexpected description")
 
-    def _fake_extract(client: Any, description: str) -> Any:
+    def _fake_extract(v1_client: Any, description: str) -> Any:
+        assert v1_client is v1_sentinel
         for s in SCENARIOS:
             if s.description == description:
                 return s.offline_pose_sequence
         raise AssertionError("Unexpected description")
 
-    def _fake_forge(
-        client: Any,
+    def _fake_forge_escalation(
+        beta_client: Any,
         settings: RoboHarnessSettings,
         pose_seq: Any,
         skill_name: str,
+        *,
+        deep: bool = False,
         **kwargs: Any,
     ) -> ForgeResult:
+        assert beta_client is v1beta_sentinel
+        seen_deep_flags.append(deep)
         forge_calls[skill_name] = forge_calls.get(skill_name, 0) + 1
         if skill_name == "imp_standing_backflip":
             return ForgeResult(
@@ -221,8 +285,11 @@ def test_live_mode_orchestration_repair_escalation_and_error_isolation(
                 environment_id="env-fork-123",
                 interaction_id="int-refuse",
                 raw_output='{"refused": true}',
+                model_used=settings.forge_model,
+                escalated_to_carbon=False,
             )
         art = deterministic_retarget_fallback(pose_seq, skill_name)
+        escalated = deep or (skill_name == "dance_floss" and forge_calls[skill_name] == 2)
         return ForgeResult(
             artifact=art,
             refused=False,
@@ -230,32 +297,45 @@ def test_live_mode_orchestration_repair_escalation_and_error_isolation(
             environment_id="env-fork-123",
             interaction_id=f"int-{skill_name}-{forge_calls[skill_name]}",
             raw_output="{}",
+            model_used=settings.forge_deep_model if escalated else settings.forge_model,
+            escalated_to_carbon=escalated,
         )
 
-    def _fake_pre_gate(client: Any, skill: Any, *args: Any, **kwargs: Any) -> DecisionGateResult:
+    def _fake_baseline_gate(beta_client: Any, *args: Any, **kwargs: Any) -> DecisionGateResult:
+        assert beta_client is v1beta_sentinel
+        return _make_gate(fidelity=1.1)
+
+    def _fake_pre_gate(
+        beta_client: Any, skill: Any, *args: Any, **kwargs: Any
+    ) -> DecisionGateResult:
+        assert beta_client is v1beta_sentinel
         if skill.name == "dance_floss" and forge_calls.get("dance_floss", 0) == 1:
             return _make_gate(route="repair_in_forge", fidelity=1.4, route_conf=0.82)
         if skill.name == "dance_floss":
             return _make_gate(route="adapt_upper_body_only", fidelity=2.5, route_conf=0.88)
         if skill.name == "asym_flamingo_balance":
-            # Borderline confidence < 0.70 triggers safe human escalation
+            # Borderline confidence 0.74 < 0.75 triggers safe human escalation
             return _make_gate(
                 route="execute_and_save",
                 effective_action="escalate_human",
-                safe_conf=0.64,
-                route_conf=0.80,
+                safe_conf=0.74,
+                route_conf=0.82,
                 fidelity=2.2,
             )
         return _make_gate(route="execute_and_save", fidelity=2.7, route_conf=0.92)
 
-    def _fake_post_gate(client: Any, skill: Any, *args: Any, **kwargs: Any) -> DecisionGateResult:
+    def _fake_post_gate(
+        beta_client: Any, skill: Any, *args: Any, **kwargs: Any
+    ) -> DecisionGateResult:
+        assert beta_client is v1beta_sentinel
         post_run_calls.append(skill.name)
         return _make_gate(route="execute_and_save", fidelity=2.8, route_conf=0.93)
 
+    monkeypatch.setattr(eval_mod, "ensure_forge_agent", _fake_ensure)
     monkeypatch.setattr(eval_mod, "generate_baseline_raw_keyframes", _fake_baseline)
-    monkeypatch.setattr(eval_mod, "evaluate_baseline_skill", lambda *a, **kw: _make_gate(fidelity=1.1))
+    monkeypatch.setattr(eval_mod, "evaluate_baseline_skill", _fake_baseline_gate)
     monkeypatch.setattr(eval_mod, "extract_motion_from_description", _fake_extract)
-    monkeypatch.setattr(eval_mod, "forge_skill", _fake_forge)
+    monkeypatch.setattr(eval_mod, "forge_skill_with_escalation", _fake_forge_escalation)
     monkeypatch.setattr(eval_mod, "evaluate_pre_execution", _fake_pre_gate)
     monkeypatch.setattr(eval_mod, "evaluate_post_run", _fake_post_gate)
 
@@ -267,8 +347,9 @@ def test_live_mode_orchestration_repair_escalation_and_error_isolation(
             "asym_flamingo_balance",
             "imp_standing_backflip",
         ],
-        client=object(),
-        settings=RoboHarnessSettings(),
+        deep=False,
+        clients=dual,
+        settings=RoboHarnessSettings(gemini_api_key="test-key"),
         quiet=True,
     )
 
@@ -276,21 +357,24 @@ def test_live_mode_orchestration_repair_escalation_and_error_isolation(
     assert report.scenario_count == 4
     by_id = {c.scenario_id: c for c in report.comparisons}
 
-    # Transient baseline error isolated cleanly without aborting remaining scenarios
+    # Transient baseline error isolated cleanly
     assert by_id["dance_floss"].baseline.status == "error"
     assert "timeout" in (by_id["dance_floss"].baseline.error or "")
 
-    # Repair retry ran once (2 attempts), then adapted upper body and executed safely
+    # Repair retry escalated to Carbon, adapted upper body, and executed safely
     assert by_id["dance_floss"].roboharness.forge_attempts == 2
+    assert by_id["dance_floss"].roboharness.escalated_to_carbon is True
+    assert by_id["dance_floss"].roboharness.model_used == "gemini-4-carbon"
     assert by_id["dance_floss"].roboharness.adaptation_mode == "upper_body_adapted"
     assert by_id["dance_floss"].roboharness.status == "executed_safe"
     assert by_id["dance_floss"].roboharness.post_fidelity_score == pytest.approx(2.8)
+    assert report.roboharness_metrics.carbon_escalations_count == 1
 
-    # Normal gesture executed + ran post-run Decisions API
+    # Normal gesture executed + ran post-run Decisions API on beta_client
     assert by_id["gesture_greeting_wave"].roboharness.status == "executed_safe"
     assert set(post_run_calls) == {"dance_floss", "gesture_greeting_wave"}
 
-    # Borderline confidence escalated safely without moving servos and logged to Failure Ledger
+    # Borderline confidence 0.74 (< 0.75) escalated safely without moving servos
     assert by_id["asym_flamingo_balance"].roboharness.status == "escalated_human"
     assert by_id["asym_flamingo_balance"].roboharness.servos_moved is False
     assert any(
@@ -298,13 +382,13 @@ def test_live_mode_orchestration_repair_escalation_and_error_isolation(
         for e in report.failure_ledger
     )
 
-    # Impossible backflip safely refused by forge without moving servos
+    # Impossible backflip safely refused without moving servos
     assert by_id["imp_standing_backflip"].roboharness.status == "refused_safe"
     assert by_id["imp_standing_backflip"].roboharness.servos_moved is False
 
-    # Rendered markdown includes live banner and failure details
     md = render_proof_markdown(report)
-    assert "Live Gemini 4 API" in md
+    assert "Live Gemini 4 Dual-Client API" in md
+    assert "`1/4`" in md
     assert "asym_flamingo_balance" in md
 
 

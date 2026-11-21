@@ -19,6 +19,8 @@ from roboharness.config import (
     DECISION_CONFIDENCE_THRESHOLD,
     DECISION_MODEL,
     FORGE_AGENT_ID,
+    FORGE_DEEP_AGENT_ID,
+    FORGE_DEEP_MODEL,
     FORGE_MODEL,
     MAX_SERVO_TEMP_C,
     MAX_TORSO_TILT_DEG,
@@ -312,7 +314,7 @@ def _render_strip_html() -> str:
       </div>
       <div class="bar-wrap">
         <div id="dec-bar" class="bar-fill"></div>
-        <div class="bar-thresh" title="0.70 auto-branch threshold"></div>
+        <div class="bar-thresh" title="{DECISION_CONFIDENCE_THRESHOLD:.2f} auto-branch threshold"></div>
       </div>
     </div>
 
@@ -336,7 +338,10 @@ def _render_strip_html() -> str:
     "hydrogen": document.getElementById("m-hydrogen"),
     "{FORGE_AGENT_ID}": document.getElementById("m-forge"),
     "{FORGE_MODEL}": document.getElementById("m-forge"),
+    "{FORGE_DEEP_AGENT_ID}": document.getElementById("m-forge"),
+    "{FORGE_DEEP_MODEL}": document.getElementById("m-forge"),
     "forge": document.getElementById("m-forge"),
+    "carbon": document.getElementById("m-forge"),
     "{DECISION_MODEL}": document.getElementById("m-decision"),
     "decision": document.getElementById("m-decision"),
     "{SPATIAL_MODEL}": document.getElementById("m-spatial"),

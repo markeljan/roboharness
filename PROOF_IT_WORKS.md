@@ -1,7 +1,7 @@
 # PROOF IT WORKS — RoboHarness 5 Sigma Evaluation
 
-> **Mode**: `offline` | **Scenarios**: `12` | **Generated**: `2026-11-21T19:01:02.597576+00:00`
-> Deterministic Offline CI Benchmark (`--mode offline`) exercising the exact 12-scenario suite, deterministic safety latches, lower-body projection, and `MockTonypiMCPServer` (including `1.45x` table-slip stress) with local rubric audit approximations. Run `--mode live` with `GEMINI_API_KEY` for live Gemini 4 model + `gemini-decision-1` scoring.
+> **Mode**: `offline` | **Deep Carbon**: `False` | **Scenarios**: `12` | **Gate Threshold**: `>= 0.75` conf & `>= 0.75` safety | **Generated**: `2026-11-21T19:11:13.645674+00:00`
+> Deterministic Offline CI Benchmark (`--mode offline`) exercising the exact 12-scenario suite, deterministic safety latches, lower-body projection, and `MockTonypiMCPServer` (including `1.45x` table-slip stress) with local rubric audit approximations. Run `--mode live` with `GEMINI_API_KEY` for live Dual-Client (`v1` + `v1beta`) Gemini 4 + `gemini-decision-1` (`>= 0.75` gate) scoring.
 
 ## Executive Summary
 
@@ -12,8 +12,9 @@
 | **Impossible-Move Safe Refusal Rate** | 0/3 (0.0%) | **3/3 (100.0%)** | +100.0 pp |
 | **Mean Fidelity Score (0..3, Offline Rubric Audit)** | 1.10 / 3.00 (conf 0.92) | **2.67 / 3.00** (conf 0.91) | +1.57 |
 | **Sim-to-Real Table Slip Survival / Detection (`1.45x`)** | 0/2 (0.0%) | **2/2 (100.0%)** | +100.0 pp |
-| **Mean End-to-End Latency** | 0.001s | 0.001s | +0.001s |
-| **Decisions API Output Tokens** | n/a (no gate) | **0** (`gemini-decision-1`) | 0 tokens |
+| **Managed Forge Carbon Escalations (`gemini-4-carbon`)** | n/a | `0/12` | auto-escalate on 2x fail |
+| **Mean End-to-End Latency** | 0.001s | 0.002s | +0.001s |
+| **Decisions API Output Tokens (`v1beta`)** | n/a (no gate) | **0** (`gemini-decision-1`) | 0 tokens |
 
 ## 12-Scenario Comparison
 
@@ -53,9 +54,9 @@ Every failure, sim-to-real table-slip margin shift, confidence-gate boundary, an
 - **`dance_orange_justice`** (`both`): Table slip 1.45x stress on Orange Justice: RoboHarness 3.8 -> 5.5 deg vs Baseline A 66.9 -> 97.0 deg. RoboHarness (upper_body_adapted) survived cleanly with safety margin reduced from 26.2 deg to 24.6 deg. Baseline A amplified to 97.0 deg (hardware_aborted=True). Note: any unadapted static pose >= 20.7 deg would pass offline static checks yet trip the live IMU watchdog under 1.45x slip.
 - **`asym_side_lunge`** (`both`): Table slip 1.45x stress on Deep Side Lunge: RoboHarness 1.0 -> 1.5 deg vs Baseline A 95.1 -> 137.8 deg. RoboHarness (upper_body_adapted) survived cleanly with safety margin reduced from 29.0 deg to 28.5 deg. Baseline A amplified to 137.8 deg (hardware_aborted=True). Note: any unadapted static pose >= 20.7 deg would pass offline static checks yet trip the live IMU watchdog under 1.45x slip.
 
-### 3. Borderline Confidence Escalations (`< 0.70`)
+### 3. Borderline Confidence Escalations (`< 0.75`)
 
-- **`all_scenarios`** (`roboharness`): 0 borderline confidence escalations (< 0.70) observed in offline run. Decisions API auto-branching strictly requires both route_conf >= 0.70 and is_physically_safe_conf >= 0.70; any ambiguous live video clip falling below 0.70 escalates to `escalate_human` without actuating servos (verified in `tests/test_decision_gate.py`).
+- **`all_scenarios`** (`roboharness`): 0 borderline confidence escalations (< 0.75) observed in offline run. Decisions API auto-branching strictly requires route_conf >= 0.75, is_physically_safe_conf >= 0.75, and is_physically_safe.noul >= 0.75; any ambiguous or borderline live clip escalates to Managed Forge repair or `escalate_human` without actuating servos (verified in `tests/test_decision_gate.py`).
 
 ### 4. Fidelity Ceilings on Adapted & Impossible Moves
 
@@ -71,9 +72,15 @@ uv run python benchmarks/eval_5sigma.py \
   --output PROOF_IT_WORKS.md \
   --json-out benchmarks/eval_results.json
 
-# Live 4-model Gemini 4 benchmark (requires GEMINI_API_KEY)
+# Live 4-model Dual-Client (v1 + v1beta) benchmark (requires GEMINI_API_KEY)
 uv run python benchmarks/eval_5sigma.py \
   --mode live \
+  --output PROOF_IT_WORKS.md \
+  --json-out benchmarks/eval_results.json
+
+# Live deep benchmark routing Managed Forge directly to gemini-4-carbon
+uv run python benchmarks/eval_5sigma.py \
+  --mode live --deep \
   --output PROOF_IT_WORKS.md \
   --json-out benchmarks/eval_results.json
 ```

@@ -1,8 +1,8 @@
 # RoboHarness
 
-**Zero-shot video-to-humanoid skill forging for the Hiwonder TonyPi, powered by a 4-model Gemini 4 native hardware harness.**
+**Zero-shot video-to-humanoid skill forging for the Hiwonder TonyPi, powered by a dual-client Gemini 4 native hardware harness.**
 
-Built clean-room for the **Gemini 4 NYC Hackathon** (*Problem Statement One: "5 Sigma"* + *Best Use of Managed Agents*), RoboHarness watches **any** short human video — a live 5-second webcam recording of a judge or an uploaded MP4 (e.g., a Fortnite dance) — extracts beat-synced motion, retargets and physics-verifies 16-DOF trajectories inside a forked Google Managed Agent Ubuntu sandbox, gates safety and fidelity with the **0-output-token Decisions API**, saves SHA-256 signed reusable skills, and executes live on a physical TonyPi robot exclusively over **Streamable HTTP MCP**.
+Built clean-room for the **Gemini 4 NYC Hackathon** (*Problem Statement One: "5 Sigma"* + *Best Use of Managed Agents*), RoboHarness watches **any** short human video — a live 5-second webcam recording of a judge or an uploaded MP4 (e.g., a Fortnite dance) — analyzes it with **Agentic Video Processing** (`processing="agentic"`), retargets and physics-verifies 16-DOF trajectories inside a forked Google Managed Agent sandbox (`gemini-4-neon` with automatic escalation to `gemini-4-carbon`), gates safety and fidelity with the **0-output-token Decisions API** (`confidence >= 0.75` and `is_physically_safe >= 0.75`), saves SHA-256 signed reusable skills, and executes live on a physical TonyPi robot exclusively over **Streamable HTTP MCP**.
 
 ---
 
@@ -10,18 +10,19 @@ Built clean-room for the **Gemini 4 NYC Hackathon** (*Problem Statement One: "5 
 
 ```mermaid
 flowchart LR
-    In["5s Webcam / MP4 Video"] --> H["gemini-4-hydrogen<br/>Pose Extraction (medium)"]
-    Cam["TonyPi perceive() Frame"] --> ER["gemini-robotics-er-2-preview<br/>Workspace & Edge Check"]
-    H --> Forge["Managed Agent: roboharness-skill-forge<br/>antigravity-preview-09-2026 + gemini-4-neon<br/>Forked Ubuntu Sandbox + kinematics_verify.py"]
+    In["5s Webcam / MP4 Video"] --> Files["Files API Upload<br/>processing='agentic'"]
+    Files --> H["v1: gemini-4-hydrogen<br/>Pose Extraction (medium)<br/>+ debug-video (high)"]
+    Cam["TonyPi perceive() Frame"] --> ER["v1beta: gemini-robotics-er-2-preview<br/>Workspace & Edge Check (medium)"]
+    H --> Forge["v1beta: Managed Agent Skill Forge<br/>roboharness-skill-forge (gemini-4-neon)<br/>2-Fail / --deep Escalation -> gemini-4-carbon<br/>remote fork OR GEMINI_ENVIRONMENT_ID"]
     ER --> Forge
-    Forge --> Gate["gemini-decision-1<br/>0-Output-Token Multimodal Gate<br/>(confidence >= 0.70)"]
-    Gate -- "repair_in_forge (1 retry)" --> Forge
+    Forge --> Gate["v1beta: gemini-decision-1<br/>0-Output-Token Multimodal Gate<br/>(confidence >= 0.75 AND safe >= 0.75)"]
+    Gate -- "repair_in_forge" --> Forge
     Gate -- "adapt_upper_body_only" --> Proj["Upper-Body Safe Projection"]
     Gate -- "refuse_impossible / escalate_human" --> Stop["Safe Stop (0 Servo Commands)"]
     Gate -- "execute_and_save" --> Latch["Deterministic Non-LLM Safety Latches<br/>(>=10.9V, <70C, <30 deg, 0 clip)"]
     Proj --> Latch
     Latch --> Store["Signed Skill Library<br/>skills/&lt;name&gt;.json (SHA-256)"]
-    Store --> Reflex["gemini-4-hydrogen (low)<br/>Live Reflex Speech"]
+    Store --> Reflex["v1: gemini-4-hydrogen (medium)<br/>Live Reflex Speech"]
     Reflex --> MCP["Streamable HTTP MCP Boundary<br/>TONYPI_MCP_URL (127.0.0.1:8765/mcp)"]
     MCP --> Robot["Hiwonder TonyPi / MockTonypiMCPServer"]
     Robot -. "Post-Run Frame + IMU" .-> Gate
@@ -30,35 +31,35 @@ flowchart LR
 
 ---
 
-## 4-Model Responsibility Matrix (Zero Overlap)
+## Dual-Client & 4-Model Responsibility Matrix
 
-Every Gemini 4 API call runs on `google-genai >= 3.2.0` locked to `http_options={"api_version": "v1beta"}`, with zero forbidden sampling/caching overrides (`temperature`, `top_p`, `top_k`, `cachedContents`, `max_output_tokens`) and strictly valid `thinking_level` values (`low`, `medium`, `high`, `xhigh`).
+RoboHarness strictly separates stable `v1` and `v1beta` SDK clients in [`src/roboharness/models.py`](src/roboharness/models.py) (`DualGenAIClients`), with zero forbidden sampling/caching/token-cap overrides (`temperature`, `top_p`, `top_k`, `cachedContents`, `max_output_tokens`, `max_total_tokens`) and strictly valid `thinking_level` values (`medium` / `high` on Interactions calls, never `minimal`):
 
-| Model / Agent | Role | `thinking_level` / Mode | Module |
-| :--- | :--- | :--- | :--- |
-| **`gemini-4-hydrogen`** | Video & text beat-synced 6–14 keyframe `PoseSequence` extraction + impossible-move flagging (`jump`, `backflip`, `splits`), plus crisp `<=18`-word live reflex speech (`mcp.say`) | `"medium"` (extract) / `"low"` (reflex) | [`src/roboharness/motion_extractor.py`](src/roboharness/motion_extractor.py) |
-| **Managed Agent `roboharness-skill-forge`** (`antigravity-preview-09-2026` + **`gemini-4-neon`**) | Sandboxed 16-DOF servo retargeting, grounded lower-body adaptation, and iterative Python kinematics verification & repair inside a forked Ubuntu environment | Model locked at `agents.create(...)` | [`src/roboharness/managed_forge.py`](src/roboharness/managed_forge.py), [`agent_bundle/`](agent_bundle/) |
-| **`gemini-decision-1`** | 0-output-token parallel 4-question gate (`is_physically_safe`, `needs_lower_body_adaptation`, `move_fidelity` 0–3, `route` with `"other"` fallback) for pre-execution routing and post-run fidelity scoring | **0 output tokens**; auto-branch only when `confidence >= 0.70` | [`src/roboharness/decision_gate.py`](src/roboharness/decision_gate.py) |
-| **`gemini-robotics-er-2-preview`** | Live spatial workspace framing check on `perceive()` camera JPEGs (`centered_on_table`, `workspace_clear`, `robot_bbox_norm`, `clearance_margin`) | `"medium"` | [`src/roboharness/spatial.py`](src/roboharness/spatial.py) |
+| Model / Agent | SDK Client | Role | Mode / `thinking_level` | Module |
+| :--- | :--- | :--- | :--- | :--- |
+| **`gemini-4-hydrogen`** | Stable **`v1`** (`make_v1_client`) | Agentic video (`processing="agentic"`) & text beat-synced 6–14 keyframe `PoseSequence` extraction, impossible-move flagging, crisp live reflex speech, and post-trial video debugging (`roboharness debug-video`) | `"medium"` (extract/reflex), `"high"` (`debug-video`) | [`src/roboharness/motion_extractor.py`](src/roboharness/motion_extractor.py) |
+| **Managed Agent `roboharness-skill-forge`** (`antigravity-preview-09-2026` + **`gemini-4-neon`**, escalating to **`gemini-4-carbon`** via `roboharness-skill-forge-carbon`) | **`v1beta`** (`make_beta_client`) | Sandboxed 16-DOF servo retargeting, grounded lower-body adaptation, and iterative Python physics verification; escalates to `gemini-4-carbon` after 2 failed Neon kinematics verifications or when `--deep` is set | Locked at `agents.create(...)`; zero `max_total_tokens` cap | [`src/roboharness/managed_forge.py`](src/roboharness/managed_forge.py), [`agent_bundle/`](agent_bundle/) |
+| **`gemini-decision-1`** | **`v1beta`** (`make_beta_client`) | 0-output-token parallel 4-question gate (`is_physically_safe`, `needs_lower_body_adaptation`, `move_fidelity` 0–3, `route` with `"other"` fallback — never `"none_of_the_above"`) for pre-execution routing and post-run fidelity scoring | **0 output tokens**; auto-branch requires `confidence >= 0.75` **AND** `is_physically_safe >= 0.75` | [`src/roboharness/decision_gate.py`](src/roboharness/decision_gate.py) |
+| **`gemini-robotics-er-2-preview`** | **`v1beta`** (`make_beta_client`) | Live spatial workspace framing check on `perceive()` camera JPEGs (`centered_on_table`, `workspace_clear`, `robot_bbox_norm`, `clearance_margin`) | `"medium"` | [`src/roboharness/spatial.py`](src/roboharness/spatial.py) |
 
 ---
 
-## Managed Agent Environment Forking & `kinematics-verifier` Skill
+## Managed Agent Skill Forge: Environment Forking, Self-Hosted Docker, & Carbon Escalation
 
-To make live hardware demos fast and deterministic without cold-starting environment setup on every video:
-
-1. **Bootstrap & Self-Test**: `roboharness forge-setup` runs a one-time bootstrap interaction on `antigravity-preview-09-2026` staging three inline workspace files:
-   - [`agent_bundle/.agents/AGENTS.md`](agent_bundle/.agents/AGENTS.md) — sandbox operating loop (retarget -> verify -> repair -> return strict JSON or safe refusal).
-   - [`agent_bundle/.agents/skills/kinematics-verifier/SKILL.md`](agent_bundle/.agents/skills/kinematics-verifier/SKILL.md) — complete 16-DOF Hiwonder TonyPi servo map (IDs 1–16, exact pulse bounds, upper/lower roles) and grounded adaptation heuristics.
-   - [`agent_bundle/kinematics_verify.py`](agent_bundle/kinematics_verify.py) — zero-dependency Python 3 verifier matching local hardware safety limits (`--self-test`, JSON report, and `--auto-fix`).
-2. **Environment Forking**: Once `python3 /workspace/kinematics_verify.py --self-test` exits `0`, RoboHarness creates the persistent custom agent `id="roboharness-skill-forge"` with `agent_config={"type": "antigravity", "model": "gemini-4-neon"}` and `base_environment=bootstrap.environment_id`. Every subsequent `mimic` call forks directly from the warm verified sandbox.
-3. **Optional Remote MCP**: When `TONYPI_REMOTE_MCP_URL` is configured and `--remote-mcp` is passed, the Managed Agent also receives the MCP server tool named `tonypi_mcp` (`^[a-z0-9_-]+$`).
+1. **Hosted Remote Forking (Default `environment="remote"`)**:
+   - `roboharness forge-setup` runs a one-time bootstrap interaction on `antigravity-preview-09-2026` staging [`agent_bundle/.agents/AGENTS.md`](agent_bundle/.agents/AGENTS.md), [`agent_bundle/.agents/skills/kinematics-verifier/SKILL.md`](agent_bundle/.agents/skills/kinematics-verifier/SKILL.md), and [`agent_bundle/kinematics_verify.py`](agent_bundle/kinematics_verify.py).
+   - Once `python3 /workspace/kinematics_verify.py --self-test` exits `0`, RoboHarness creates persistent custom agent `roboharness-skill-forge` (`gemini-4-neon`) with `base_environment=bootstrap.environment_id`. Passing `--deep` also pre-stages `roboharness-skill-forge-carbon` (`gemini-4-carbon`).
+2. **Self-Hosted Docker / MuJoCo Environment (`GEMINI_ENVIRONMENT_ID`)**:
+   - Set `GEMINI_ENVIRONMENT_ID` to route Managed Agent interactions directly to your self-hosted Docker/MuJoCo environment (`environment=settings.gemini_environment_id`, omitting hosted-only `sources` and `network.allowlist`).
+3. **Automatic Neon -> Carbon Escalation**:
+   - Standard runs execute on `gemini-4-neon` up to 2 attempts, feeding exact local kinematics violations into attempt 2. If `gemini-4-neon` fails deterministic kinematics verification twice — or if you pass `--deep` — RoboHarness escalates directly to `gemini-4-carbon` (`roboharness-skill-forge-carbon`) with zero `max_total_tokens` cap.
+4. **Optional Remote MCP**: When `TONYPI_REMOTE_MCP_URL` is configured and `--remote-mcp` is passed, the Managed Agent receives the remote MCP tool named `tonypi_mcp` (`^[a-z0-9_-]+$`).
 
 ---
 
 ## Deterministic Hardware Safety Latches & Clean-Room Boundary
 
-LLMs never directly command servos without passing deterministic, non-LLM physics and hardware checks ([`src/roboharness/safety.py`](src/roboharness/safety.py)):
+LLMs never command servos without passing deterministic, non-LLM physics and hardware checks ([`src/roboharness/safety.py`](src/roboharness/safety.py)):
 
 | Latch | Hard Threshold | Enforcement Point |
 | :--- | :--- | :--- |
@@ -68,12 +69,12 @@ LLMs never directly command servos without passing deterministic, non-LLM physic
 | **Joint-Limit Clipping** | `joint_clipping_count == 0` (all 16 servos) | Sandbox + local defense-in-depth before MCP dispatch |
 | **Servo Slew & Timing** | `<= 900 pulses/sec`, `duration_ms >= 80 ms` | Sandbox + local defense-in-depth |
 | **Artifact Integrity** | Canonical SHA-256 signature verified on load/save | [`src/roboharness/skill_store.py`](src/roboharness/skill_store.py) |
-| **Confidence Escalation** | `route_conf >= 0.70` and `is_physically_safe_conf >= 0.70` | Low-confidence decisions escalate safely without moving servos |
+| **Decisions Auto-Branch Gate** | `confidence >= 0.75` **AND** `is_physically_safe >= 0.75` | Below threshold escalates to Managed Forge repair or human approval (0 servos moved) |
 
-### Clean-Room Boundary
+### Clean-Room & Live-Mode Boundary
 - **Net-New Implementation**: All code in this repository is written from scratch.
 - **External Hardware Driver Only**: [`markeljan/tonypi`](https://github.com/markeljan/tonypi) is treated strictly as an unchanged external MIT hardware driver reached **only** over Streamable HTTP MCP (`TONYPI_MCP_URL`, default `http://127.0.0.1:8765/mcp`).
-- **Offline Determinism (`< 2s`)**: [`MockTonypiMCPServer`](src/roboharness/mock_mcp.py) implements the full JSON-RPC 2.0 Streamable HTTP MCP handshake, dynamic batch/frame/action dispatch, Pillow stick-figure camera frames, and fault injection (low battery, over-temp, table slip, edge risk) so the entire automated test suite and offline benchmark run in under 2 seconds with zero hardware.
+- **Zero Mocked Live Paths**: Passing `--mock` only swaps in [`MockTonypiMCPServer`](src/roboharness/mock_mcp.py) for hardware; Gemini API calls remain live and fail loudly if `GEMINI_API_KEY` is unset. Offline CI/tests require passing `--offline` explicitly.
 - **No Streamlit**: Passing `--ui` launches a minimal stdlib SSE telemetry strip at `http://127.0.0.1:8770` ([`src/roboharness/telemetry_sse.py`](src/roboharness/telemetry_sse.py)) designed to stay visually subordinate to the physical robot.
 
 ---
@@ -84,40 +85,46 @@ LLMs never directly command servos without passing deterministic, non-LLM physic
 ```bash
 uv sync
 export GEMINI_API_KEY="your-gemini-api-key"
-# Optional: point to your TonyPi MCP server (defaults to http://127.0.0.1:8765/mcp)
+# Optional: TonyPi MCP server (defaults to http://127.0.0.1:8765/mcp)
 export TONYPI_MCP_URL="http://127.0.0.1:8765/mcp"
+# Optional: self-hosted Docker/MuJoCo sandbox environment ID (defaults to "remote")
+export GEMINI_ENVIRONMENT_ID="env-..."
 ```
+*(A local `.env` file in the repo root is auto-loaded by `RoboHarnessSettings.from_env()` without overriding exported shell variables.)*
 
 ### 2. Pre-Flight Check & Managed Agent Setup
 ```bash
-# Verify all 4 Gemini models + TONYPI_MCP_URL (add --mock if hardware is offline)
+# Verify v1 + v1beta Gemini models & TONYPI_MCP_URL (add --mock if hardware is offline)
 uv run roboharness check
 
-# Pre-stage & fork the Ubuntu sandbox into custom agent "roboharness-skill-forge"
-uv run roboharness forge-setup
+# Pre-stage & fork "roboharness-skill-forge" (add --deep to also warm gemini-4-carbon)
+uv run roboharness forge-setup --deep
 ```
 
-### 3. Live Demo: Mimic Any Video & Build Your Skill Library
+### 3. Live Demo: Mimic Any Video, Replay, & Debug Trials
 ```bash
 # Live 5-second webcam recording of a judge + minimal SSE telemetry strip on :8770
 uv run roboharness mimic --webcam 5 --name judge_wave --ui
 
-# Upload any short MP4 (e.g., a Fortnite dance) -> extract, forge, gate, sign, execute
-uv run roboharness mimic --video clip.mp4 --name floss
+# Upload any short MP4 (e.g., a Fortnite dance); add --deep for direct gemini-4-carbon forging
+uv run roboharness mimic --video clip.mp4 --name floss --deep
 
 # Replay any saved, SHA-256-verified skill on demand
 uv run roboharness run floss
 
 # Inspect saved skills, peak tilt, clipping count, fidelity score, and SHA-256 hashes
 uv run roboharness list
+
+# Diagnose a recorded robot trial using Agentic Video Processing (thinking_level="high")
+uv run roboharness debug-video --video trial.mp4 --name floss --expected "Stable hips and alternating arm swing"
 ```
 
-### 4. Fast Offline Test & Demo (Zero Hardware, Zero API Keys)
+### 4. Fast Offline CI & Benchmark (Zero Hardware, Zero API Keys)
 ```bash
-# Run the full offline test suite (< 2s)
+# Run the full offline test suite
 uv run pytest -q
 
-# Dry-run / mock mimic end-to-end in offline mode
+# Explicit offline smoke test against MockTonypiMCPServer
 uv run roboharness mimic --video clip.mp4 --name demo_wave --mock --offline
 ```
 
@@ -127,13 +134,13 @@ uv run roboharness mimic --video clip.mp4 --name demo_wave --mock --offline
 
 - **[`PROOF_IT_WORKS.md`](PROOF_IT_WORKS.md)** — Quantitative 12-scenario evaluation across 4 categories (3 Dances, 3 Gestures, 3 Asymmetric Poses, 3 Impossible Moves + sim-to-real `1.45x` table-slip stress tests) comparing **Baseline A** (single-shot `gemini-4-hydrogen`) against **Full RoboHarness**, complete with an **Honest Failure Ledger**.
   ```bash
-  # Re-run deterministic offline 12-scenario benchmark (< 1s)
+  # Deterministic offline 12-scenario benchmark (< 1s)
   uv run python benchmarks/eval_5sigma.py --mode offline --output PROOF_IT_WORKS.md --json-out benchmarks/eval_results.json
 
-  # Run live 12-scenario benchmark against real Gemini 4 APIs
+  # Live 12-scenario benchmark against real Gemini 4 APIs (optional --deep for Carbon)
   uv run python benchmarks/eval_5sigma.py --mode live --output PROOF_IT_WORKS.md --json-out benchmarks/eval_results.json
   ```
-- **[`GEMINI.md`](GEMINI.md)** — Clean-Room Constitution, Gemini 4 `v1beta` SDK invariants, Managed Agent configuration rules, Decisions API schema constraints, and hardware safety latches (continuously enforced by [`tests/test_sdk_invariants.py`](tests/test_sdk_invariants.py)).
+- **[`GEMINI.md`](GEMINI.md)** — Clean-Room Constitution, Dual-Client (`v1` + `v1beta`) SDK invariants, Agentic Video Processing, Managed Agent configuration & Carbon escalation rules, Decisions API `0.75` thresholds, and hardware safety latches (continuously enforced by [`tests/test_sdk_invariants.py`](tests/test_sdk_invariants.py)).
 
 ---
 
@@ -141,7 +148,7 @@ uv run roboharness mimic --video clip.mp4 --name demo_wave --mock --offline
 
 ```text
 roboharness/
-├── GEMINI.md                        # Clean-room & Gemini 4 v1beta invariants
+├── GEMINI.md                        # Clean-room & Gemini 4 Dual-Client invariants
 ├── PROOF_IT_WORKS.md                # 12-scenario 5 Sigma benchmark + Failure Ledger
 ├── agent_bundle/                    # Staged into Managed Agent forked Ubuntu sandbox
 │   ├── .agents/AGENTS.md
@@ -151,15 +158,16 @@ roboharness/
 │   ├── scenarios.py                 # 12 unseen scenarios (dance/gesture/asymmetric/impossible)
 │   └── eval_5sigma.py               # Offline & live Baseline A vs RoboHarness proof engine
 ├── src/roboharness/
-│   ├── cli.py                       # Typer + Rich CLI (`roboharness`)
-│   ├── config.py                    # Safety thresholds, model IDs, env settings
+│   ├── cli.py                       # Typer + Rich CLI (`roboharness`, incl. `debug-video`)
+│   ├── config.py                    # Safety & 0.75 decision thresholds, model IDs, .env loader
+│   ├── models.py                    # DualGenAIClients (v1 + v1beta), Agentic Video upload, param guards
+│   ├── genai_client.py              # Re-exports models.py helpers for backwards compatibility
 │   ├── schemas.py                   # Pydantic v2 models + 16-DOF TonyPi joint specs
 │   ├── safety.py                    # Non-LLM safety latches, CoM model, SHA-256 signing
-│   ├── genai_client.py              # v1beta client factory, inline/Files video prep, param guard
-│   ├── motion_extractor.py          # gemini-4-hydrogen pose extraction, Baseline A, reflex speech
-│   ├── spatial.py                   # gemini-robotics-er-2-preview tabletop framing check
-│   ├── managed_forge.py             # Managed Agent setup, env forking, skill forging
-│   ├── decision_gate.py             # 0-output-token gemini-decision-1 pre/post gates
+│   ├── motion_extractor.py          # v1 gemini-4-hydrogen agentic extraction, debug_trial_video, reflex speech
+│   ├── spatial.py                   # v1beta gemini-robotics-er-2-preview tabletop framing check
+│   ├── managed_forge.py             # v1beta Managed Agent setup, env forking / GEMINI_ENVIRONMENT_ID, Neon->Carbon
+│   ├── decision_gate.py             # v1beta 0-output-token gemini-decision-1 gates (>=0.75)
 │   ├── skill_store.py               # Atomic SHA-256 verified skills/<name>.json library
 │   ├── mcp_client.py                # Streamable HTTP MCP JSON-RPC 2.0 client
 │   ├── mock_mcp.py                  # Deterministic offline MockTonypiMCPServer + fault injection

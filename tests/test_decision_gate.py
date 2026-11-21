@@ -1,4 +1,4 @@
-"""Offline tests for gemini-decision-1 multimodal gate and signed skill store."""
+"""Offline tests for gemini-decision-1 multimodal gate (v1beta, >=0.75) and signed skill store."""
 
 from __future__ import annotations
 
@@ -16,7 +16,11 @@ from google.genai._gaos.types.decisions import (
     ScoreAnswer,
 )
 
-from roboharness.config import DECISION_MODEL
+from roboharness.config import (
+    DECISION_CONFIDENCE_THRESHOLD,
+    DECISION_MODEL,
+    DECISION_SAFETY_PROB_THRESHOLD,
+)
 from roboharness.decision_gate import (
     MAX_DECISION_FRAMES,
     POST_RUN_QUESTIONS,
@@ -151,7 +155,7 @@ def _make_sdk_response(
     adapt_prob: float = 0.12,
     adapt_conf: float = 0.88,
     fidelity_score: float = 2.65,
-    fidelity_conf: float = 0.72,
+    fidelity_conf: float = 0.78,
     route: str = "execute_and_save",
     route_conf: float = 0.91,
     route_probabilities: dict[str, float] | None = None,
@@ -176,7 +180,7 @@ def _make_sdk_response(
                     "2": "Recognizable adaptation",
                     "3": "High-fidelity retargeting",
                 },
-                probabilities={"0": 0.01, "1": 0.04, "2": 0.23, "3": 0.72},
+                probabilities={"0": 0.01, "1": 0.04, "2": 0.17, "3": 0.78},
             ),
             "route": ChoiceAnswer(
                 choice=route,
@@ -197,7 +201,7 @@ class _StubDecisionsAPI:
         return self.response
 
 
-class _StubClient:
+class _StubBetaClient:
     def __init__(self, response: Any) -> None:
         self.decisions = _StubDecisionsAPI(response)
 
@@ -208,6 +212,9 @@ class _StubClient:
 
 
 def test_question_schemas_invariants_and_sdk_validation() -> None:
+    assert DECISION_CONFIDENCE_THRESHOLD == pytest.approx(0.75)
+    assert DECISION_SAFETY_PROB_THRESHOLD == pytest.approx(0.75)
+
     for qset in (PRE_EXECUTION_QUESTIONS, POST_RUN_QUESTIONS):
         serialized = json.dumps(qset)
         assert "none_of_the_above" not in serialized
@@ -233,7 +240,6 @@ def test_question_schemas_invariants_and_sdk_validation() -> None:
             "other",
         }
 
-        # Validate directly against real google-genai CreateDecisionRequest Pydantic schema
         decision_input = build_decision_input(
             _make_sample_skill(),
             _make_sample_pose_seq(),
@@ -270,14 +276,12 @@ def test_build_decision_input_format_and_frame_cap() -> None:
     assert len(image_blocks) == MAX_DECISION_FRAMES == 6
     assert len(text_blocks) == 1
 
-    # Every image block enforces low resolution and JPEG mime type
     for img in image_blocks:
         assert img["mime_type"] == "image/jpeg"
         assert img["resolution"] == "low"
         decoded = base64.b64decode(img["data"])
         assert decoded.startswith(b"jpeg-frame-")
 
-    # Even sampling keeps first and last frame
     assert base64.b64decode(image_blocks[0]["data"]) == b"jpeg-frame-0"
     assert base64.b64decode(image_blocks[-1]["data"]) == b"jpeg-frame-9"
 
@@ -292,7 +296,7 @@ def test_build_decision_input_format_and_frame_cap() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Response parsing, confidence gating, and safety overrides
+# Response parsing, >= 0.75 confidence + >= 0.75 safety gating, and overrides
 # ---------------------------------------------------------------------------
 
 
@@ -319,7 +323,6 @@ def test_parse_sdk_response_and_dict_stub() -> None:
     assert parsed_sdk.auto_branch_allowed is True
     assert parsed_sdk.effective_action == "execute_and_save"
 
-    # Dict-style stub response parses identically
     dict_resp = {
         "answers": {
             "is_physically_safe": {"noul": 0.92, "confidence": 0.92},
@@ -352,9 +355,9 @@ def test_parse_sdk_response_and_dict_stub() -> None:
     ],
 )
 def test_auto_branching_high_confidence_routes(route: str) -> None:
-    client = _StubClient(
+    beta_client = _StubBetaClient(
         _make_sdk_response(
-            safe_prob=0.88,
+            safe_prob=0.88 if route in {"execute_and_save", "adapt_upper_body_only"} else 0.15,
             safe_conf=0.88,
             adapt_prob=0.82 if route == "adapt_upper_body_only" else 0.15,
             adapt_conf=0.82,
@@ -363,131 +366,154 @@ def test_auto_branching_high_confidence_routes(route: str) -> None:
         )
     )
     res = evaluate_pre_execution(
-        client,
-        _make_sample_skill(),
-        _make_sample_pose_seq(),
-        [b"jpg1"],
-        _make_robot_status(),
+        beta_client=beta_client,
+        skill=_make_sample_skill(),
+        pose_seq=_make_sample_pose_seq(),
+        frame_jpegs=[b"jpg1"],
+        robot_status=_make_robot_status(),
     )
-    assert len(client.decisions.calls) == 1
-    assert client.decisions.calls[0]["model"] == "gemini-decision-1"
+    assert len(beta_client.decisions.calls) == 1
+    assert beta_client.decisions.calls[0]["model"] == "gemini-decision-1"
     assert res.auto_branch_allowed is True
     assert res.route == route
     assert res.effective_action == route
 
 
 def test_route_other_escalates_even_at_high_confidence() -> None:
-    client = _StubClient(
+    beta_client = _StubBetaClient(
         _make_sdk_response(safe_prob=0.90, safe_conf=0.90, route="other", route_conf=0.85)
     )
     res = evaluate_pre_execution(
-        client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
+        beta_client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
     )
     assert res.route == "other"
     assert res.auto_branch_allowed is False
     assert res.effective_action == "escalate_human"
 
 
-def test_low_route_confidence_escalates_safely() -> None:
-    client = _StubClient(
+@pytest.mark.parametrize("bad_route_conf", [0.65, 0.74])
+def test_low_route_confidence_escalates_safely(bad_route_conf: float) -> None:
+    beta_client = _StubBetaClient(
         _make_sdk_response(
             safe_prob=0.92,
             safe_conf=0.92,
             route="execute_and_save",
-            route_conf=0.65,
+            route_conf=bad_route_conf,
         )
     )
     res = evaluate_pre_execution(
-        client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
+        beta_client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
     )
-    assert res.min_confidence == pytest.approx(0.65)
+    assert res.min_confidence == pytest.approx(bad_route_conf)
     assert res.auto_branch_allowed is False
     assert res.effective_action == "escalate_human"
 
 
-def test_low_safety_confidence_escalates_safely() -> None:
-    client = _StubClient(
+@pytest.mark.parametrize("bad_safe_conf", [0.62, 0.74])
+def test_low_safety_confidence_escalates_safely(bad_safe_conf: float) -> None:
+    beta_client = _StubBetaClient(
         _make_sdk_response(
-            safe_prob=0.62,
-            safe_conf=0.62,
+            safe_prob=0.90,
+            safe_conf=bad_safe_conf,
             route="execute_and_save",
             route_conf=0.91,
         )
     )
     res = evaluate_pre_execution(
-        client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
+        beta_client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
     )
-    assert res.min_confidence == pytest.approx(0.62)
+    assert res.min_confidence == pytest.approx(bad_safe_conf)
     assert res.auto_branch_allowed is False
     assert res.effective_action == "escalate_human"
 
 
-def test_exact_threshold_confidence_allows_auto_branch() -> None:
-    client = _StubClient(
+@pytest.mark.parametrize("route", ["execute_and_save", "adapt_upper_body_only"])
+def test_exact_075_boundary_accepted_and_074_safety_prob_rejected(route: str) -> None:
+    # Exact 0.75 on route_conf, safe_conf, and safe_prob -> accepted for auto-branching
+    ok_client = _StubBetaClient(
         _make_sdk_response(
-            safe_prob=0.70,
-            safe_conf=0.70,
-            route="execute_and_save",
-            route_conf=0.70,
+            safe_prob=0.75,
+            safe_conf=0.75,
+            route=route,
+            route_conf=0.75,
         )
     )
-    res = evaluate_pre_execution(
-        client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
+    ok_res = evaluate_pre_execution(
+        ok_client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
     )
-    assert res.min_confidence == pytest.approx(0.70)
-    assert res.auto_branch_allowed is True
-    assert res.effective_action == "execute_and_save"
+    assert ok_res.min_confidence == pytest.approx(0.75)
+    assert ok_res.auto_branch_allowed is True
+    assert ok_res.effective_action == route
+
+    # 0.74 safety probability (with high confidence 0.90) -> rejected into repair_in_forge
+    low_prob_client = _StubBetaClient(
+        _make_sdk_response(
+            safe_prob=0.74,
+            safe_conf=0.90,
+            route=route,
+            route_conf=0.90,
+        )
+    )
+    low_prob_res = evaluate_pre_execution(
+        low_prob_client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
+    )
+    assert low_prob_res.auto_branch_allowed is False
+    assert low_prob_res.effective_action == "repair_in_forge"
 
 
-def test_safety_override_blocks_execution_when_unsafe() -> None:
-    # Even if route chose execute_and_save with high conf, unsafe noul (0.15, conf 0.90) overrides.
-    client_refuse = _StubClient(
+def test_safety_override_refuses_when_safe_prob_below_025_and_escalates_on_low_conf() -> None:
+    # safe_prob=0.15 (< 0.25) with high confidence 0.90 overrides execute_and_save -> refuse_impossible
+    refuse_client = _StubBetaClient(
         _make_sdk_response(
             safe_prob=0.15,
             safe_conf=0.90,
             route="execute_and_save",
-            route_conf=0.82,
-            route_probabilities={
-                "execute_and_save": 0.82,
-                "adapt_upper_body_only": 0.02,
-                "repair_in_forge": 0.04,
-                "refuse_impossible": 0.10,
-                "other": 0.02,
-            },
+            route_conf=0.85,
         )
     )
     res_refuse = evaluate_pre_execution(
-        client_refuse, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
+        refuse_client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
     )
     assert res_refuse.route == "execute_and_save"
-    assert res_refuse.auto_branch_allowed is True
+    assert res_refuse.auto_branch_allowed is False
     assert res_refuse.effective_action == "refuse_impossible"
 
-    # When repair_in_forge has higher runner-up probability, downgrades to repair_in_forge.
-    client_repair = _StubClient(
+    # safe_prob=0.55 (0.25..0.74) with high confidence 0.88 overrides execute_and_save -> repair_in_forge
+    repair_client = _StubBetaClient(
         _make_sdk_response(
-            safe_prob=0.15,
-            safe_conf=0.90,
+            safe_prob=0.55,
+            safe_conf=0.88,
             route="execute_and_save",
-            route_conf=0.80,
-            route_probabilities={
-                "execute_and_save": 0.80,
-                "adapt_upper_body_only": 0.02,
-                "repair_in_forge": 0.14,
-                "refuse_impossible": 0.03,
-                "other": 0.01,
-            },
+            route_conf=0.85,
         )
     )
     res_repair = evaluate_pre_execution(
-        client_repair, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
+        repair_client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
     )
+    assert res_repair.auto_branch_allowed is False
     assert res_repair.effective_action == "repair_in_forge"
+
+    # safe_prob=0.15 with LOW confidence 0.65 -> escalate_human
+    low_conf_client = _StubBetaClient(
+        _make_sdk_response(
+            safe_prob=0.15,
+            safe_conf=0.65,
+            route="execute_and_save",
+            route_conf=0.85,
+        )
+    )
+    res_low_conf = evaluate_pre_execution(
+        low_conf_client, _make_sample_skill(), None, [b"jpg1"], _make_robot_status()
+    )
+    assert res_low_conf.auto_branch_allowed is False
+    assert res_low_conf.effective_action == "escalate_human"
 
 
 def test_parse_missing_answer_raises_value_error() -> None:
     with pytest.raises(ValueError, match="missing required answer"):
-        parse_decision_response({"answers": {"is_physically_safe": {"noul": 0.9, "confidence": 0.9}}})
+        parse_decision_response(
+            {"answers": {"is_physically_safe": {"noul": 0.9, "confidence": 0.9}}}
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +527,7 @@ def test_evaluate_post_run_with_and_without_post_run_jpeg() -> None:
     ref_frames = [f"ref-{i}".encode() for i in range(8)]
     post_frame = b"post-run-camera-frame"
 
-    client_with = _StubClient(
+    client_with = _StubBetaClient(
         _make_sdk_response(
             safe_prob=0.95,
             safe_conf=0.95,
@@ -521,20 +547,18 @@ def test_evaluate_post_run_with_and_without_post_run_jpeg() -> None:
     img_blocks = [b for b in call_with["input"] if b["type"] == "image"]
     assert len(img_blocks) == 6
     assert all(b["resolution"] == "low" for b in img_blocks)
-    # Post-run frame is guaranteed to be preserved as the final image block
     assert base64.b64decode(img_blocks[-1]["data"]) == post_frame
     text_payload = json.loads(call_with["input"][-1]["text"])
     assert text_payload["extra_context"]["evaluation_stage"] == "post_run"
     assert text_payload["extra_context"]["has_post_run_frame"] is True
     assert text_payload["extra_context"]["post_run_frame_index"] == 5
 
-    # Without post_run_jpeg
-    client_without = _StubClient(
+    client_without = _StubBetaClient(
         _make_sdk_response(
             safe_prob=0.91,
             safe_conf=0.91,
             fidelity_score=2.1,
-            fidelity_conf=0.74,
+            fidelity_conf=0.78,
             route="execute_and_save",
             route_conf=0.85,
         )
@@ -549,7 +573,7 @@ def test_evaluate_post_run_with_and_without_post_run_jpeg() -> None:
 
 
 def test_evaluate_baseline_skill_uses_same_rubric() -> None:
-    client = _StubClient(
+    beta_client = _StubBetaClient(
         _make_sdk_response(
             safe_prob=0.22,
             safe_conf=0.88,
@@ -560,7 +584,7 @@ def test_evaluate_baseline_skill_uses_same_rubric() -> None:
         )
     )
     res = evaluate_baseline_skill(
-        client,
+        beta_client,
         _make_sample_skill("baseline-jump"),
         "Human performs a 360 jump spin.",
         _make_robot_status(),
@@ -568,7 +592,7 @@ def test_evaluate_baseline_skill_uses_same_rubric() -> None:
     assert res.effective_action == "repair_in_forge"
     assert res.move_fidelity_score == pytest.approx(0.9)
 
-    call = client.decisions.calls[0]
+    call = beta_client.decisions.calls[0]
     assert call["model"] == "gemini-decision-1"
     assert call["questions"] is PRE_EXECUTION_QUESTIONS
     payload = json.loads(call["input"][-1]["text"])
@@ -586,7 +610,17 @@ def test_slugify_skill_name_valid_and_rejects_traversal() -> None:
     assert slugify_skill_name("---Wave---") == "wave"
     assert SKILL_SLUG_RE.match(slugify_skill_name("Robot Pop & Lock #1"))
 
-    for bad in ("../evil", "../../etc/passwd", "/etc/passwd", "sub/dir", "a\\b", "..", "", "   ", "!!!"):
+    for bad in (
+        "../evil",
+        "../../etc/passwd",
+        "/etc/passwd",
+        "sub/dir",
+        "a\\b",
+        "..",
+        "",
+        "   ",
+        "!!!",
+    ):
         with pytest.raises(ValueError):
             slugify_skill_name(bad)
 
@@ -594,7 +628,6 @@ def test_slugify_skill_name_valid_and_rejects_traversal() -> None:
 def test_skill_store_atomic_save_load_list_delete_and_tamper(tmp_path: Path) -> None:
     skills_dir = tmp_path / "skills"
 
-    # Auto-signs unsigned skill and preserves DecisionGateResult cleanly through JSON round-trip
     gate = parse_decision_response(_make_sdk_response())
     skill_old = _make_sample_skill(
         "Disco Wave!",
@@ -604,7 +637,6 @@ def test_skill_store_atomic_save_load_list_delete_and_tamper(tmp_path: Path) -> 
     path_old = save_skill(skill_old, skills_dir)
     assert path_old == skills_dir / "disco-wave.json"
     assert path_old.is_file()
-    # No leftover temporary files
     assert list(skills_dir.glob("*.tmp")) == []
 
     loaded = load_skill("Disco Wave!", skills_dir)
@@ -613,12 +645,10 @@ def test_skill_store_atomic_save_load_list_delete_and_tamper(tmp_path: Path) -> 
     assert loaded.decision_gate is not None
     assert loaded.decision_gate.effective_action == "execute_and_save"
 
-    # Saving an already-tampered artifact is rejected before writing
     bad_sig = loaded.model_copy(update={"artifact_sha256": "0" * 64})
     with pytest.raises(ValueError, match="artifact_sha256"):
         save_skill(bad_sig, skills_dir)
 
-    # Save a newer skill and verify list_skills descending order + graceful skipping
     skill_new = _make_sample_skill(
         "victory_bow",
         created_at="2026-11-21T15:30:00+00:00",
@@ -631,7 +661,6 @@ def test_skill_store_atomic_save_load_list_delete_and_tamper(tmp_path: Path) -> 
     listed = list_skills(skills_dir)
     assert [s.name for s in listed] == ["victory_bow", "Disco Wave!"]
 
-    # Tamper with saved JSON on disk -> load_skill detects SHA-256 mismatch
     raw = json.loads(path_old.read_text(encoding="utf-8"))
     raw["keyframes"][0]["servos"]["r_shoulder_pitch"] = 625
     path_old.write_text(json.dumps(raw, indent=2), encoding="utf-8")
@@ -639,14 +668,11 @@ def test_skill_store_atomic_save_load_list_delete_and_tamper(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="signature verification failed"):
         load_skill("disco-wave", skills_dir)
 
-    # Disabling verify_signature allows forensic inspection
     tampered_loaded = load_skill("disco-wave", skills_dir, verify_signature=False)
     assert tampered_loaded.keyframes[0].servos["r_shoulder_pitch"] == 625
 
-    # Tampered file is excluded from list_skills
     assert [s.name for s in list_skills(skills_dir)] == ["victory_bow"]
 
-    # Delete behavior & missing skill FileNotFoundError
     assert delete_skill("victory_bow", skills_dir) is True
     assert delete_skill("victory_bow", skills_dir) is False
     with pytest.raises(FileNotFoundError):

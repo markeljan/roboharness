@@ -285,6 +285,8 @@ def test_telemetry_sse_server_endpoints_and_streaming() -> None:
         assert "text/html" in index.headers["content-type"]
         assert "gemini-4-hydrogen" in index.text
         assert "gemini-decision-1" in index.text
+        assert "gemini-4-carbon" in index.text
+        assert "0.75 auto-branch threshold" in index.text
         assert "EventSource" in index.text
 
         received: list[dict[str, Any]] = []

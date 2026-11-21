@@ -1,12 +1,15 @@
 """Typer + Rich CLI for RoboHarness (`roboharness`).
 
 Provides judge-ready commands for learning skills from live webcam or video clips,
-replaying signed skills, inspecting the local skill library, preflight checking all
-4 Gemini 4 models + `TONYPI_MCP_URL`, and pre-staging the Managed Agent Skill Forge.
+replaying signed skills, inspecting the local skill library, preflight checking the
+dual-client (`v1` + `v1beta`) Gemini 4 stack + `TONYPI_MCP_URL`, pre-staging the
+Managed Agent Skill Forge (`gemini-4-neon` + `gemini-4-carbon`), and debugging robot
+trial videos with Agentic Video Processing (`processing="agentic"`).
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -18,11 +21,18 @@ from rich.panel import Panel
 from rich.table import Table
 
 from roboharness.capture import CaptureError, record_webcam_clip
-from roboharness.config import RoboHarnessSettings
-from roboharness.genai_client import make_client
-from roboharness.managed_forge import ensure_forge_agent
+from roboharness.config import (
+    BETA_API_VERSION,
+    DECISION_CONFIDENCE_THRESHOLD,
+    DECISION_SAFETY_PROB_THRESHOLD,
+    STABLE_API_VERSION,
+    RoboHarnessSettings,
+)
+from roboharness.managed_forge import ForgeAgentState, ensure_forge_agent
 from roboharness.mcp_client import MCPClientError, TonypiMCPClient
 from roboharness.mock_mcp import MockTonypiMCPServer
+from roboharness.models import DualGenAIClients, make_dual_clients
+from roboharness.motion_extractor import debug_trial_video
 from roboharness.pipeline import MimicPipeline, MimicResult, PreflightReport, run_preflight_check
 from roboharness.skill_store import list_skills
 from roboharness.telemetry_sse import TelemetryHub, TelemetrySSEServer
@@ -51,6 +61,47 @@ def _console() -> Console:
     return Console(highlight=False, width=width)
 
 
+def _sandbox_mode_label(settings: RoboHarnessSettings) -> str:
+    """Describe whether self-hosted GEMINI_ENVIRONMENT_ID or hosted 'remote' sandbox is active."""
+    if settings.gemini_environment_id:
+        return (
+            f"Self-hosted Docker/MuJoCo "
+            f"(GEMINI_ENVIRONMENT_ID={settings.gemini_environment_id})"
+        )
+    return 'Hosted remote sandbox (environment="remote")'
+
+
+def _client_split_label() -> str:
+    """Describe the Builder Guide dual-client split between v1 and v1beta."""
+    return (
+        f"Dual Clients: {STABLE_API_VERSION} (GA Interactions: hydrogen, debug-video) | "
+        f"{BETA_API_VERSION} (Managed Agents, Environments, Decisions, spatial preview)"
+    )
+
+
+def _require_live_clients(
+    console: Console,
+    settings: RoboHarnessSettings,
+    *,
+    command_hint: str,
+    allow_offline_hint: bool = True,
+) -> DualGenAIClients:
+    """Instantiate live DualGenAIClients or exit loudly with zero mocked fallback."""
+    if not settings.gemini_api_key:
+        offline_note = (
+            " Pass `--offline` explicitly for deterministic offline CI "
+            "(`--mock` only mocks TonyPi MCP hardware)."
+            if allow_offline_hint
+            else ""
+        )
+        console.print(
+            f"[bold red]Error:[/bold red] GEMINI_API_KEY (or GOOGLE_API_KEY) is required "
+            f"for live `roboharness {command_hint}`.{offline_note}"
+        )
+        raise typer.Exit(code=1)
+    return make_dual_clients(settings.gemini_api_key)
+
+
 def _build_mcp_client(
     settings: RoboHarnessSettings,
     *,
@@ -77,7 +128,11 @@ def _render_mimic_result(console: Console, result: MimicResult) -> None:
     if result.saved_path:
         header_lines.append(f"[bold]Saved Path:[/bold] {result.saved_path}")
     if result.forge_attempts:
-        header_lines.append(f"[bold]Forge Attempts:[/bold] {result.forge_attempts}")
+        model_tag = f" ({result.forge_model_used})" if result.forge_model_used else ""
+        esc_tag = " [yellow](escalated to gemini-4-carbon)[/yellow]" if result.escalated_to_carbon else ""
+        header_lines.append(
+            f"[bold]Forge Attempts:[/bold] {result.forge_attempts}{model_tag}{esc_tag}"
+        )
     if result.announcement:
         header_lines.append(f'[bold]Robot Announcement:[/bold] "{result.announcement}"')
 
@@ -85,7 +140,10 @@ def _render_mimic_result(console: Console, result: MimicResult) -> None:
 
     if result.spatial is not None:
         sp = result.spatial
-        sp_table = Table(title="Spatial Workspace Framing (gemini-robotics-er-2-preview)", box=None)
+        sp_table = Table(
+            title=f"Spatial Workspace Framing (gemini-robotics-er-2-preview, {BETA_API_VERSION})",
+            box=None,
+        )
         sp_table.add_column("Field", style="bold dim")
         sp_table.add_column("Value")
         sp_table.add_row("Centered on Table", str(sp.centered_on_table))
@@ -119,7 +177,11 @@ def _render_mimic_result(console: Console, result: MimicResult) -> None:
         console.print(kin_table)
 
     if result.pre_decision is not None or result.post_decision is not None:
-        dec_table = Table(title="Decisions API Gate (gemini-decision-1, 0 output tokens)")
+        dec_title = (
+            f"Decisions API Gate (gemini-decision-1, {BETA_API_VERSION}, 0 output tokens, "
+            f"conf>={DECISION_CONFIDENCE_THRESHOLD:.2f} & safe>={DECISION_SAFETY_PROB_THRESHOLD:.2f})"
+        )
+        dec_table = Table(title=dec_title)
         dec_table.add_column("Phase")
         dec_table.add_column("Safe Prob", justify="right")
         dec_table.add_column("Adapt Prob", justify="right")
@@ -167,8 +229,20 @@ def _render_mimic_result(console: Console, result: MimicResult) -> None:
         console.print(ex_table)
 
 
-def _render_preflight_report(console: Console, report: PreflightReport) -> None:
-    """Render a Rich preflight diagnostics table."""
+def _render_preflight_report(
+    console: Console,
+    report: PreflightReport,
+    settings: RoboHarnessSettings,
+) -> None:
+    """Render a Rich preflight diagnostics panel and status table."""
+    console.print(
+        Panel(
+            f"[bold]Client Split:[/bold] {_client_split_label()}\n"
+            f"[bold]Sandbox Mode:[/bold] {_sandbox_mode_label(settings)}",
+            title="RoboHarness Runtime Topology",
+            border_style="cyan",
+        )
+    )
     table = Table(title="RoboHarness Preflight Check")
     table.add_column("Component", style="bold")
     table.add_column("Status")
@@ -221,14 +295,14 @@ def mimic(
         bool,
         typer.Option(
             "--mock/--no-mock",
-            help="Run against in-process MockTonypiMCPServer instead of physical TonyPi.",
+            help="Mock TonyPi MCP hardware only (Gemini calls stay live unless --offline is set).",
         ),
     ] = False,
     offline: Annotated[
         bool,
         typer.Option(
             "--offline/--no-offline",
-            help="Skip live Gemini API calls and use deterministic offline mode.",
+            help="Explicitly skip live Gemini API calls for deterministic offline CI.",
         ),
     ] = False,
     remote_mcp: Annotated[
@@ -236,6 +310,13 @@ def mimic(
         typer.Option(
             "--remote-mcp/--no-remote-mcp",
             help="Expose TONYPI_REMOTE_MCP_URL to the Managed Agent sandbox.",
+        ),
+    ] = False,
+    deep: Annotated[
+        bool,
+        typer.Option(
+            "--deep/--no-deep",
+            help="Route directly to gemini-4-carbon Managed Agent (roboharness-skill-forge-carbon).",
         ),
     ] = False,
     speed_scale: Annotated[
@@ -251,17 +332,10 @@ def mimic(
 
     settings = RoboHarnessSettings.from_env()
     resolved_device = device if device is not None else settings.webcam_device
-    use_offline = offline or (mock and not settings.gemini_api_key)
 
-    client = None
-    if not use_offline:
-        if not settings.gemini_api_key:
-            console.print(
-                "[bold red]Error:[/bold red] GEMINI_API_KEY (or GOOGLE_API_KEY) is not set. "
-                "Export an API key or pass --offline / --mock."
-            )
-            raise typer.Exit(code=1)
-        client = make_client(settings.gemini_api_key)
+    dual_clients: DualGenAIClients | None = None
+    if not offline:
+        dual_clients = _require_live_clients(console, settings, command_hint="mimic")
 
     video_path: Path
     if webcam is not None:
@@ -292,11 +366,11 @@ def mimic(
     try:
         with mcp_client:
             pipeline = MimicPipeline(
-                client=client,
+                clients=dual_clients,
                 mcp=mcp_client,
                 settings=settings,
                 hub=hub,
-                offline_mode=use_offline,
+                offline_mode=offline,
             )
             result = pipeline.mimic_video(
                 video_path,
@@ -305,8 +379,9 @@ def mimic(
                 run_spatial=spatial,
                 use_remote_mcp=remote_mcp,
                 speed_scale=speed_scale,
+                deep=deep,
             )
-    except (MCPClientError, CaptureError, ValueError, FileNotFoundError) as exc:
+    except (MCPClientError, CaptureError, ValueError, FileNotFoundError, RuntimeError) as exc:
         console.print(f"[bold red]Mimic pipeline error:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
     finally:
@@ -343,14 +418,14 @@ def run(
         bool,
         typer.Option(
             "--mock/--no-mock",
-            help="Run against in-process MockTonypiMCPServer instead of physical TonyPi.",
+            help="Mock TonyPi MCP hardware only (Gemini calls stay live unless --offline is set).",
         ),
     ] = False,
     offline: Annotated[
         bool,
         typer.Option(
             "--offline/--no-offline",
-            help="Skip live Gemini API calls (spatial/announcement/post-run gate).",
+            help="Explicitly skip live Gemini API calls (spatial/announcement/post-run gate).",
         ),
     ] = False,
     speed_scale: Annotated[
@@ -361,11 +436,10 @@ def run(
     """Load a SHA-256 signed skill from skills/ and execute it on TonyPi."""
     console = _console()
     settings = RoboHarnessSettings.from_env()
-    use_offline = offline or (mock and not settings.gemini_api_key)
 
-    client = None
-    if not use_offline and settings.gemini_api_key:
-        client = make_client(settings.gemini_api_key)
+    dual_clients: DualGenAIClients | None = None
+    if not offline:
+        dual_clients = _require_live_clients(console, settings, command_hint="run")
 
     hub: TelemetryHub | None = None
     sse_server: TelemetrySSEServer | None = None
@@ -379,11 +453,11 @@ def run(
     try:
         with mcp_client:
             pipeline = MimicPipeline(
-                client=client,
+                clients=dual_clients,
                 mcp=mcp_client,
                 settings=settings,
                 hub=hub,
-                offline_mode=use_offline,
+                offline_mode=offline,
             )
             result = pipeline.run_saved_skill(
                 skill_name,
@@ -391,7 +465,7 @@ def run(
                 run_spatial=spatial,
                 speed_scale=speed_scale,
             )
-    except (FileNotFoundError, ValueError, MCPClientError) as exc:
+    except (FileNotFoundError, ValueError, MCPClientError, RuntimeError) as exc:
         console.print(f"[bold red]Run skill failed:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
     finally:
@@ -463,21 +537,21 @@ def check(
         ),
     ] = False,
 ) -> None:
-    """Run live preflight verification across all 4 Gemini 4 models and TONYPI_MCP_URL."""
+    """Run live preflight verification across v1 + v1beta Gemini 4 models and TONYPI_MCP_URL."""
     console = _console()
     settings = RoboHarnessSettings.from_env()
-    client = make_client(settings.gemini_api_key) if settings.gemini_api_key else None
+    dual_clients = make_dual_clients(settings.gemini_api_key) if settings.gemini_api_key else None
     mcp_client, _mock_server = _build_mcp_client(settings, mock=mock)
 
     with mcp_client:
         report = run_preflight_check(
-            client,
-            mcp_client,
-            settings,
+            clients=dual_clients,
+            mcp=mcp_client,
+            settings=settings,
             skip_forge_create=skip_forge_create,
         )
 
-    _render_preflight_report(console, report)
+    _render_preflight_report(console, report, settings)
     if not report.all_ok:
         raise typer.Exit(code=1)
 
@@ -491,32 +565,112 @@ def forge_setup(
             help="Delete and recreate the Managed Agent and forked sandbox environment.",
         ),
     ] = False,
+    deep: Annotated[
+        bool,
+        typer.Option(
+            "--deep/--no-deep",
+            help="Also pre-stage the gemini-4-carbon Managed Agent (roboharness-skill-forge-carbon).",
+        ),
+    ] = False,
 ) -> None:
-    """Create or verify the Managed Agent Skill Forge and pre-staged sandbox environment."""
+    """Create or verify the v1beta Managed Agent Skill Forge and sandbox environment."""
     console = _console()
     settings = RoboHarnessSettings.from_env()
-    if not settings.gemini_api_key:
-        console.print(
-            "[bold red]Error:[/bold red] GEMINI_API_KEY (or GOOGLE_API_KEY) is required "
-            "for `roboharness forge-setup`."
-        )
-        raise typer.Exit(code=1)
+    dual_clients = _require_live_clients(
+        console,
+        settings,
+        command_hint="forge-setup",
+        allow_offline_hint=False,
+    )
 
-    client = make_client(settings.gemini_api_key)
+    states: list[ForgeAgentState] = []
     try:
-        state = ensure_forge_agent(client, settings, force_recreate=force)
+        states.append(
+            ensure_forge_agent(
+                dual_clients.beta_client,
+                settings,
+                force_recreate=force,
+                deep=False,
+            )
+        )
+        if deep:
+            states.append(
+                ensure_forge_agent(
+                    dual_clients.beta_client,
+                    settings,
+                    force_recreate=force,
+                    deep=True,
+                )
+            )
     except (ValueError, RuntimeError, OSError) as exc:
         console.print(f"[bold red]Forge setup failed:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    action = "Created & pre-staged" if state.created_now else "Reused existing"
-    summary = (
-        f"[bold]Status:[/bold] [green]{action}[/green]\n"
-        f"[bold]Agent ID:[/bold] {state.agent_id}\n"
-        f"[bold]Model:[/bold] {state.model}\n"
-        f"[bold]Base Environment ID:[/bold] {state.base_environment_id or '--'}"
+    lines = [
+        f"[bold]Client Split:[/bold] {_client_split_label()}",
+        f"[bold]Sandbox Mode:[/bold] {_sandbox_mode_label(settings)}",
+    ]
+    for state in states:
+        action = "Created & pre-staged" if state.created_now else "Reused existing"
+        lines.append(
+            f"[bold]{state.agent_id}[/bold] ({state.model}): [green]{action}[/green] "
+            f"| env={state.base_environment_id or '--'}"
+        )
+    console.print(Panel("\n".join(lines), title="Managed Agent Skill Forge", border_style="green"))
+
+
+@app.command(name="debug-video")
+def debug_video(
+    video: Annotated[
+        Path,
+        typer.Option("--video", help="Path to a recorded robot trial MP4/MOV video to diagnose."),
+    ],
+    name: Annotated[
+        str,
+        typer.Option("--name", help="Skill name being analyzed in the trial video."),
+    ],
+    expected: Annotated[
+        str,
+        typer.Option(
+            "--expected",
+            help="Expected robot posture, motion timing, or stability criteria.",
+        ),
+    ] = "Balanced execution without tilt >= 30 deg, joint clipping, or table slip.",
+) -> None:
+    """Diagnose a trial recording via Agentic Video Processing (`processing='agentic'`, high)."""
+    console = _console()
+    if not video.is_file():
+        console.print(f"[bold red]Error:[/bold red] Video file not found: {video}")
+        raise typer.Exit(code=2)
+
+    settings = RoboHarnessSettings.from_env()
+    dual_clients = _require_live_clients(
+        console,
+        settings,
+        command_hint="debug-video",
+        allow_offline_hint=False,
     )
-    console.print(Panel(summary, title="Managed Agent Skill Forge", border_style="green"))
+
+    try:
+        diagnosis = debug_trial_video(
+            dual_clients.client,
+            video,
+            skill_name=name,
+            expected_behavior=expected,
+            thinking_level="high",
+        )
+    except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+        console.print(f"[bold red]Debug video failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    header = (
+        f"[bold]Skill:[/bold] {name}\n"
+        f"[bold]Video:[/bold] {video}\n"
+        f"[bold]Client / Mode:[/bold] {STABLE_API_VERSION} | processing=\"agentic\" | "
+        "thinking_level=\"high\""
+    )
+    console.print(Panel(header, title="Agentic Video Trial Debugger", border_style="cyan"))
+    console.print(json.dumps(diagnosis, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

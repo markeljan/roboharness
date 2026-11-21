@@ -1,5 +1,12 @@
 """5 Sigma Proof Engine for RoboHarness: Baseline A vs Full RoboHarness across 12 scenarios.
 
+Dual-client architecture (Gemini 4 Builder Guide):
+- Stable ``v1`` client (`clients.client`): ``gemini-4-hydrogen`` (motion extraction & Baseline A).
+- ``v1beta`` client (`clients.beta_client`): Managed Agent Skill Forge
+  (``antigravity-preview-09-2026`` + ``gemini-4-neon`` with automatic ``gemini-4-carbon``
+  escalation on ``--deep`` or 2 failed kinematics attempts) and 0-output-token Decisions API
+  (``gemini-decision-1``, ``>= 0.75`` confidence & ``>= 0.75`` physical-safety gate).
+
 Usage:
     uv run python benchmarks/eval_5sigma.py \
         --mode offline \
@@ -30,6 +37,7 @@ if str(_REPO_ROOT) not in sys.path:
 from benchmarks.scenarios import SCENARIOS, MotionScenario, ScenarioCategory, get_scenario
 from roboharness.config import (
     DECISION_CONFIDENCE_THRESHOLD,
+    DECISION_SAFETY_PROB_THRESHOLD,
     MAX_TORSO_TILT_DEG,
     RoboHarnessSettings,
 )
@@ -38,14 +46,14 @@ from roboharness.decision_gate import (
     evaluate_post_run,
     evaluate_pre_execution,
 )
-from roboharness.genai_client import make_client
 from roboharness.managed_forge import (
     deterministic_retarget_fallback,
     ensure_forge_agent,
-    forge_skill,
+    forge_skill_with_escalation,
 )
 from roboharness.mcp_client import TonypiMCPClient
 from roboharness.mock_mcp import MockTonypiMCPServer
+from roboharness.models import DualGenAIClients, make_dual_clients
 from roboharness.motion_extractor import (
     extract_motion_from_description,
     generate_baseline_raw_keyframes,
@@ -109,6 +117,8 @@ class RoboHarnessScenarioResult(BaseModel):
     route: str
     adaptation_mode: Literal["full_body", "upper_body_adapted", "refused", "none"]
     forge_attempts: int = 0
+    model_used: str = ""
+    escalated_to_carbon: bool = False
     kinematics_verified: bool = False
     static_peak_tilt_deg: float = 0.0
     observed_peak_tilt_deg: float = 0.0
@@ -160,6 +170,7 @@ class SystemAggregateMetrics(BaseModel):
     slip_stress_total: int
     slip_stress_survived_or_detected_count: int
     slip_stress_survival_rate: float
+    carbon_escalations_count: int = 0
     mean_latency_s: float
     decisions_output_tokens: int = 0
 
@@ -183,6 +194,7 @@ class BenchmarkReport(BaseModel):
     """Complete 5 Sigma benchmark output serialized to JSON and PROOF_IT_WORKS.md."""
 
     mode: EvalMode
+    deep: bool = False
     generated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     scenario_count: int
     baseline_metrics: SystemAggregateMetrics
@@ -255,7 +267,6 @@ def _estimate_offline_fidelity(
         penalty = min(1.8, 0.25 * report.joint_clipping_count + 0.35 * len(report.violations))
         return round(max(0.30, 2.0 - penalty), 2), 0.88
 
-    # Measure expressive upper-body dynamic range across keyframes
     peak_upper_delta = 0
     for kf in keyframes:
         for joint in UPPER_BODY_JOINTS:
@@ -266,7 +277,6 @@ def _estimate_offline_fidelity(
     stability_bonus = max(0.0, (MAX_TORSO_TILT_DEG - observed_tilt_deg) / MAX_TORSO_TILT_DEG)
 
     if adaptation_mode == "upper_body_adapted":
-        # Honest fidelity ceiling when lower body is adapted to a grounded bounce
         score = 2.05 + 0.35 * expressiveness + 0.15 * stability_bonus
         score = min(2.55, score)
         conf = 0.86
@@ -340,10 +350,16 @@ def _run_baseline_offline(scenario: MotionScenario) -> BaselineScenarioResult:
     )
 
 
-def _run_baseline_live(client: Any, scenario: MotionScenario) -> BaselineScenarioResult:
+def _run_baseline_live(
+    clients: DualGenAIClients,
+    settings: RoboHarnessSettings,
+    scenario: MotionScenario,
+) -> BaselineScenarioResult:
+    """Run Baseline A on live v1 client (gemini-4-hydrogen) + v1beta Decisions API rubric."""
     t0 = time.perf_counter()
     try:
-        keyframes = generate_baseline_raw_keyframes(client, scenario.description)
+        # Stable v1 client for gemini-4-hydrogen single-shot baseline
+        keyframes = generate_baseline_raw_keyframes(clients.client, scenario.description)
         report = check_skill_keyframes(keyframes)
         artifact = SkillArtifact(
             name=f"baseline_{scenario.id}",
@@ -352,7 +368,6 @@ def _run_baseline_live(client: Any, scenario: MotionScenario) -> BaselineScenari
             kinematics=report,
         )
 
-        # Fetch pre-run telemetry and score on exact same gemini-decision-1 rubric
         server = MockTonypiMCPServer(
             mode="batch", table_slip_multiplier=scenario.table_slip_multiplier
         )
@@ -360,12 +375,15 @@ def _run_baseline_live(client: Any, scenario: MotionScenario) -> BaselineScenari
             mcp.connect()
             pre_status = mcp.get_status()
             ref_jpeg, _ = mcp.perceive()
+            # v1beta client for gemini-decision-1 scoring on exact same rubric
             gate = evaluate_baseline_skill(
-                client,
+                clients.beta_client,
                 artifact,
                 scenario.description,
                 pre_status,
                 frame_jpegs=[ref_jpeg],
+                confidence_threshold=settings.decision_confidence_threshold,
+                safety_prob_threshold=settings.decision_safety_prob_threshold,
             )
             raw_frames = [
                 {"duration_ms": kf.duration_ms, "servos": dict(kf.servos), "note": kf.note}
@@ -438,6 +456,8 @@ def _run_roboharness_offline(scenario: MotionScenario) -> RoboHarnessScenarioRes
             route="refuse_impossible",
             adaptation_mode="refused",
             forge_attempts=1,
+            model_used="offline_deterministic",
+            escalated_to_carbon=False,
             kinematics_verified=True,
             static_peak_tilt_deg=0.0,
             observed_peak_tilt_deg=0.0,
@@ -489,6 +509,8 @@ def _run_roboharness_offline(scenario: MotionScenario) -> RoboHarnessScenarioRes
             route="repair_in_forge",
             adaptation_mode=artifact.adaptation_mode,
             forge_attempts=1,
+            model_used="offline_deterministic",
+            escalated_to_carbon=False,
             kinematics_verified=False,
             static_peak_tilt_deg=report.peak_torso_tilt_deg,
             observed_peak_tilt_deg=0.0,
@@ -544,6 +566,8 @@ def _run_roboharness_offline(scenario: MotionScenario) -> RoboHarnessScenarioRes
         route=route,
         adaptation_mode=artifact.adaptation_mode,
         forge_attempts=1,
+        model_used="offline_deterministic",
+        escalated_to_carbon=False,
         kinematics_verified=report.verified,
         static_peak_tilt_deg=report.peak_torso_tilt_deg,
         observed_peak_tilt_deg=obs_tilt,
@@ -564,26 +588,37 @@ def _run_roboharness_offline(scenario: MotionScenario) -> RoboHarnessScenarioRes
 
 
 def _run_roboharness_live(
-    client: Any,
+    clients: DualGenAIClients,
     settings: RoboHarnessSettings,
     scenario: MotionScenario,
+    *,
+    deep: bool = False,
 ) -> RoboHarnessScenarioResult:
+    """Run Full RoboHarness with Dual Clients (v1 Interactions + v1beta Forge & Decisions)."""
     t0 = time.perf_counter()
     notes: list[str] = []
     forge_attempts = 0
+    model_used = settings.forge_deep_model if deep else settings.forge_model
+    escalated_to_carbon = deep
     try:
-        # 1. Motion extraction via real gemini-4-hydrogen
-        pose_seq = extract_motion_from_description(client, scenario.description)
+        # 1. Motion extraction via real gemini-4-hydrogen on stable v1 client
+        pose_seq = extract_motion_from_description(clients.client, scenario.description)
 
-        # 2. Managed Agent Skill Forge (antigravity-preview-09-2026 + gemini-4-neon)
+        # 2. Managed Agent Skill Forge on v1beta client (Neon with auto-escalation to Carbon)
         forge_attempts = 1
-        forge_res = forge_skill(
-            client,
+        forge_res = forge_skill_with_escalation(
+            clients.beta_client,
             settings,
             pose_seq,
             scenario.id,
-            ensure_agent=False,
+            deep=deep,
+            ensure_agent=True,
         )
+        model_used = forge_res.model_used or model_used
+        escalated_to_carbon = escalated_to_carbon or forge_res.escalated_to_carbon
+        if forge_res.escalated_to_carbon and not deep:
+            notes.append(f"Auto-escalated from {settings.forge_model} to {model_used}.")
+
         if forge_res.refused or forge_res.artifact is None:
             reason = forge_res.refusal_reason or "Skill Forge safely refused impossible motion."
             notes.append(reason)
@@ -594,6 +629,8 @@ def _run_roboharness_live(
                 route="refuse_impossible",
                 adaptation_mode="refused",
                 forge_attempts=forge_attempts,
+                model_used=model_used,
+                escalated_to_carbon=escalated_to_carbon,
                 kinematics_verified=True,
                 static_peak_tilt_deg=0.0,
                 observed_peak_tilt_deg=0.0,
@@ -620,17 +657,18 @@ def _run_roboharness_live(
             pre_status = mcp.get_status()
             ref_jpeg, _ = mcp.perceive()
 
-            # 3. Pre-execution Decisions API gate (0 output tokens)
+            # 3. Pre-execution Decisions API gate on v1beta client (0 output tokens, >= 0.75 gate)
             pre_gate = evaluate_pre_execution(
-                client,
+                clients.beta_client,
                 artifact,
                 pose_seq,
                 [ref_jpeg],
                 pre_status,
                 confidence_threshold=settings.decision_confidence_threshold,
+                safety_prob_threshold=settings.decision_safety_prob_threshold,
             )
 
-            # Bounded 1-retry repair in Managed Agent forge if requested
+            # Bounded 1-retry repair in Managed Agent forge (escalating to Carbon if needed)
             if pre_gate.effective_action == "repair_in_forge":
                 forge_attempts = 2
                 feedback = (
@@ -642,14 +680,17 @@ def _run_roboharness_live(
                     "and adapt lower body to a grounded bounce if needed."
                 )
                 notes.append("Triggered 1 bounded repair pass in Managed Agent forge.")
-                retry_res = forge_skill(
-                    client,
+                retry_res = forge_skill_with_escalation(
+                    clients.beta_client,
                     settings,
                     pose_seq,
                     scenario.id,
+                    deep=deep,
                     repair_feedback=feedback,
-                    ensure_agent=False,
+                    ensure_agent=True,
                 )
+                model_used = retry_res.model_used or model_used
+                escalated_to_carbon = escalated_to_carbon or retry_res.escalated_to_carbon
                 if retry_res.refused or retry_res.artifact is None:
                     notes.append(retry_res.refusal_reason or "Refused on repair pass.")
                     return RoboHarnessScenarioResult(
@@ -659,6 +700,8 @@ def _run_roboharness_live(
                         route="refuse_impossible",
                         adaptation_mode="refused",
                         forge_attempts=forge_attempts,
+                        model_used=model_used,
+                        escalated_to_carbon=escalated_to_carbon,
                         kinematics_verified=True,
                         servos_moved=False,
                         physically_safe_pass=True,
@@ -671,12 +714,13 @@ def _run_roboharness_live(
                     )
                 artifact = retry_res.artifact
                 pre_gate = evaluate_pre_execution(
-                    client,
+                    clients.beta_client,
                     artifact,
                     pose_seq,
                     [ref_jpeg],
                     pre_status,
                     confidence_threshold=settings.decision_confidence_threshold,
+                    safety_prob_threshold=settings.decision_safety_prob_threshold,
                 )
 
             # Upper-body-only safe projection if requested by Decisions API
@@ -712,6 +756,8 @@ def _run_roboharness_live(
                     route=pre_gate.effective_action,
                     adaptation_mode="refused",
                     forge_attempts=forge_attempts,
+                    model_used=model_used,
+                    escalated_to_carbon=escalated_to_carbon,
                     kinematics_verified=artifact.kinematics.verified,
                     static_peak_tilt_deg=artifact.kinematics.peak_torso_tilt_deg,
                     observed_peak_tilt_deg=0.0,
@@ -737,7 +783,8 @@ def _run_roboharness_live(
                 )
                 notes.append(
                     f"Halted safely without actuating servos ({pre_gate.effective_action}, "
-                    f"min_conf={pre_gate.min_confidence:.2f})."
+                    f"min_conf={pre_gate.min_confidence:.2f}, "
+                    f"safe_prob={pre_gate.is_physically_safe_prob:.2f})."
                 )
                 return RoboHarnessScenarioResult(
                     scenario_id=scenario.id,
@@ -746,6 +793,8 @@ def _run_roboharness_live(
                     route=pre_gate.effective_action,
                     adaptation_mode=artifact.adaptation_mode,
                     forge_attempts=forge_attempts,
+                    model_used=model_used,
+                    escalated_to_carbon=escalated_to_carbon,
                     kinematics_verified=artifact.kinematics.verified,
                     static_peak_tilt_deg=artifact.kinematics.peak_torso_tilt_deg,
                     observed_peak_tilt_deg=0.0,
@@ -779,6 +828,8 @@ def _run_roboharness_live(
                     route=pre_gate.effective_action,
                     adaptation_mode=artifact.adaptation_mode,
                     forge_attempts=forge_attempts,
+                    model_used=model_used,
+                    escalated_to_carbon=escalated_to_carbon,
                     kinematics_verified=False,
                     static_peak_tilt_deg=final_report.peak_torso_tilt_deg,
                     observed_peak_tilt_deg=0.0,
@@ -804,14 +855,15 @@ def _run_roboharness_live(
                 else None
             )
 
-            # 6. Post-run Decisions API evaluation on observed frame + final IMU telemetry
+            # 6. Post-run Decisions API evaluation on v1beta client
             post_gate = evaluate_post_run(
-                client,
+                clients.beta_client,
                 artifact,
                 [ref_jpeg],
                 post_jpeg,
                 trace.final_status,
                 confidence_threshold=settings.decision_confidence_threshold,
+                safety_prob_threshold=settings.decision_safety_prob_threshold,
             )
 
         if trace.aborted:
@@ -823,6 +875,8 @@ def _run_roboharness_live(
                 route=pre_gate.effective_action,
                 adaptation_mode=artifact.adaptation_mode,
                 forge_attempts=forge_attempts,
+                model_used=model_used,
+                escalated_to_carbon=escalated_to_carbon,
                 kinematics_verified=final_report.verified,
                 static_peak_tilt_deg=final_report.peak_torso_tilt_deg,
                 observed_peak_tilt_deg=trace.peak_observed_tilt_deg,
@@ -853,6 +907,8 @@ def _run_roboharness_live(
             route=pre_gate.effective_action,
             adaptation_mode=artifact.adaptation_mode,
             forge_attempts=forge_attempts,
+            model_used=model_used,
+            escalated_to_carbon=escalated_to_carbon,
             kinematics_verified=final_report.verified,
             static_peak_tilt_deg=final_report.peak_torso_tilt_deg,
             observed_peak_tilt_deg=trace.peak_observed_tilt_deg,
@@ -878,6 +934,8 @@ def _run_roboharness_live(
             route="error",
             adaptation_mode="none",
             forge_attempts=forge_attempts,
+            model_used=model_used,
+            escalated_to_carbon=escalated_to_carbon,
             physically_safe_pass=False,
             latency_s=round(time.perf_counter() - t0, 3),
             decisions_output_tokens=0,
@@ -941,6 +999,7 @@ def _compute_metrics(
         slip_stress_total=len(slip_comps),
         slip_stress_survived_or_detected_count=b_slip_ok,
         slip_stress_survival_rate=_safe_rate(b_slip_ok, len(slip_comps)),
+        carbon_escalations_count=0,
         mean_latency_s=b_mean_lat,
         decisions_output_tokens=0,
     )
@@ -979,6 +1038,7 @@ def _compute_metrics(
             or c.roboharness.hardware_aborted
         )
     )
+    r_carbon = sum(1 for c in comparisons if c.roboharness.escalated_to_carbon)
     r_mean_lat = (
         round(sum(c.roboharness.latency_s for c in comparisons) / total, 4) if total else 0.0
     )
@@ -1000,6 +1060,7 @@ def _compute_metrics(
         slip_stress_total=len(slip_comps),
         slip_stress_survived_or_detected_count=r_slip_ok,
         slip_stress_survival_rate=_safe_rate(r_slip_ok, len(slip_comps)),
+        carbon_escalations_count=r_carbon,
         mean_latency_s=r_mean_lat,
         decisions_output_tokens=0,
     )
@@ -1092,13 +1153,12 @@ def _build_failure_ledger(
             )
         )
 
-    # 3. Borderline Confidence Escalations (< 0.70)
+    # 3. Borderline Confidence & Safety Probability Escalations (< 0.75)
     borderline_found = False
     for c in comparisons:
         min_conf = c.roboharness.min_confidence
-        if (
-            c.roboharness.status == "escalated_human"
-            or (min_conf is not None and min_conf < DECISION_CONFIDENCE_THRESHOLD)
+        if c.roboharness.status == "escalated_human" or (
+            min_conf is not None and min_conf < DECISION_CONFIDENCE_THRESHOLD
         ):
             borderline_found = True
             ledger.append(
@@ -1113,7 +1173,8 @@ def _build_failure_ledger(
                     detail=(
                         "RoboHarness halted without moving servos (effective_action="
                         f"{c.roboharness.route}) per the >= {DECISION_CONFIDENCE_THRESHOLD:.2f} "
-                        "Decisions API confidence gate."
+                        f"confidence & >= {DECISION_SAFETY_PROB_THRESHOLD:.2f} safety-probability "
+                        "Decisions API gate."
                     ),
                 )
             )
@@ -1128,10 +1189,12 @@ def _build_failure_ledger(
                     f"observed in {mode} run"
                 ),
                 detail=(
-                    "Decisions API auto-branching strictly requires both route_conf >= 0.70 and "
-                    "is_physically_safe_conf >= 0.70; any ambiguous live video clip falling below "
-                    "0.70 escalates to `escalate_human` without actuating servos (verified in "
-                    "`tests/test_decision_gate.py`)."
+                    f"Decisions API auto-branching strictly requires route_conf >= "
+                    f"{DECISION_CONFIDENCE_THRESHOLD:.2f}, is_physically_safe_conf >= "
+                    f"{DECISION_CONFIDENCE_THRESHOLD:.2f}, and is_physically_safe.noul >= "
+                    f"{DECISION_SAFETY_PROB_THRESHOLD:.2f}; any ambiguous or borderline live clip "
+                    "escalates to Managed Forge repair or `escalate_human` without actuating "
+                    "servos (verified in `tests/test_decision_gate.py`)."
                 ),
             )
         )
@@ -1209,25 +1272,44 @@ def run_benchmark(
     mode: EvalMode = "offline",
     scenario_ids: Sequence[str] | None = None,
     limit: int | None = None,
-    client: Any | None = None,
+    deep: bool = False,
+    clients: DualGenAIClients | None = None,
     settings: RoboHarnessSettings | None = None,
     quiet: bool = False,
 ) -> BenchmarkReport:
-    """Run the 5 Sigma benchmark comparing Baseline A vs Full RoboHarness."""
+    """Run the 5 Sigma benchmark comparing Baseline A vs Full RoboHarness.
+
+    In ``--mode live``, strictly requires ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY`` (or injected
+    ``clients: DualGenAIClients`` for unit tests) and NEVER falls back to offline synthetic data.
+    """
     selected = select_scenarios(scenario_ids=scenario_ids, limit=limit)
     resolved_settings = settings or RoboHarnessSettings.from_env()
 
-    live_client = client
+    live_clients: DualGenAIClients | None = clients
     if mode == "live":
-        if live_client is None:
-            live_client = make_client(resolved_settings.gemini_api_key)
+        if live_clients is None:
+            if not resolved_settings.gemini_api_key:
+                raise RuntimeError(
+                    "Live benchmark mode (--mode live) requires GEMINI_API_KEY or "
+                    "GOOGLE_API_KEY (in environment or .env). Never falls back to offline "
+                    "mocked fixtures; pass --mode offline explicitly for offline CI."
+                )
+            live_clients = make_dual_clients(resolved_settings.gemini_api_key)
+        target_agent = (
+            resolved_settings.forge_deep_agent_id
+            if deep
+            else resolved_settings.managed_agent_id
+        )
+        target_model = (
+            resolved_settings.forge_deep_model if deep else resolved_settings.forge_model
+        )
         if not quiet:
             print(
-                f"[5-sigma] Ensuring Managed Agent '{resolved_settings.managed_agent_id}' "
-                f"({resolved_settings.base_agent} + {resolved_settings.forge_model})...",
+                f"[5-sigma] Ensuring Managed Agent '{target_agent}' "
+                f"({resolved_settings.base_agent} + {target_model}, v1beta)...",
                 flush=True,
             )
-        ensure_forge_agent(live_client, resolved_settings)
+        ensure_forge_agent(live_clients.beta_client, resolved_settings, deep=deep)
 
     comparisons: list[ScenarioComparison] = []
     total = len(selected)
@@ -1243,16 +1325,20 @@ def run_benchmark(
             baseline_res = _run_baseline_offline(scenario)
             robo_res = _run_roboharness_offline(scenario)
         else:
-            baseline_res = _run_baseline_live(live_client, scenario)
-            robo_res = _run_roboharness_live(live_client, resolved_settings, scenario)
+            assert live_clients is not None
+            baseline_res = _run_baseline_live(live_clients, resolved_settings, scenario)
+            robo_res = _run_roboharness_live(
+                live_clients, resolved_settings, scenario, deep=deep
+            )
 
         if not quiet:
+            carbon_tag = " [carbon]" if robo_res.escalated_to_carbon else ""
             print(
                 f"          Baseline A: {baseline_res.status} "
                 f"(tilt={baseline_res.observed_peak_tilt_deg:.1f}deg, "
                 f"clip={baseline_res.joint_clipping_count}, "
                 f"t={baseline_res.latency_s:.2f}s) | "
-                f"RoboHarness: {robo_res.status}/{robo_res.route} "
+                f"RoboHarness: {robo_res.status}/{robo_res.route}{carbon_tag} "
                 f"(tilt={robo_res.observed_peak_tilt_deg:.1f}deg, "
                 f"clip={robo_res.joint_clipping_count}, "
                 f"fid={robo_res.fidelity_score}, "
@@ -1280,6 +1366,7 @@ def run_benchmark(
 
     return BenchmarkReport(
         mode=mode,
+        deep=deep,
         scenario_count=len(comparisons),
         baseline_metrics=baseline_metrics,
         roboharness_metrics=robo_metrics,
@@ -1302,16 +1389,17 @@ def render_proof_markdown(report: BenchmarkReport) -> str:
     rm = report.roboharness_metrics
 
     mode_banner = (
-        "Live Gemini 4 API (`gemini-4-hydrogen`, Managed Agent `roboharness-skill-forge` on "
-        "`antigravity-preview-09-2026` + `gemini-4-neon`, and `gemini-decision-1` 0-output-token "
-        "rubric) against `MockTonypiMCPServer`."
+        "Live Gemini 4 Dual-Client API — stable `v1` (`gemini-4-hydrogen`) + `v1beta` "
+        "(Managed Agent `roboharness-skill-forge` on `antigravity-preview-09-2026` + "
+        "`gemini-4-neon` with automatic `gemini-4-carbon` escalation, and 0-output-token "
+        "`gemini-decision-1` `>= 0.75` confidence & safety gate) against `MockTonypiMCPServer`."
         if report.mode == "live"
         else (
             "Deterministic Offline CI Benchmark (`--mode offline`) exercising the exact 12-scenario "
             "suite, deterministic safety latches, lower-body projection, and `MockTonypiMCPServer` "
             "(including `1.45x` table-slip stress) with local rubric audit approximations. Run "
-            "`--mode live` with `GEMINI_API_KEY` for live Gemini 4 model + `gemini-decision-1` "
-            "scoring."
+            "`--mode live` with `GEMINI_API_KEY` for live Dual-Client (`v1` + `v1beta`) Gemini 4 "
+            "+ `gemini-decision-1` (`>= 0.75` gate) scoring."
         )
     )
 
@@ -1325,7 +1413,10 @@ def render_proof_markdown(report: BenchmarkReport) -> str:
         "# PROOF IT WORKS — RoboHarness 5 Sigma Evaluation",
         "",
         (
-            f"> **Mode**: `{report.mode}` | **Scenarios**: `{report.scenario_count}` | "
+            f"> **Mode**: `{report.mode}` | **Deep Carbon**: `{report.deep}` | "
+            f"**Scenarios**: `{report.scenario_count}` | "
+            f"**Gate Threshold**: `>= {DECISION_CONFIDENCE_THRESHOLD:.2f}` conf & "
+            f"`>= {DECISION_SAFETY_PROB_THRESHOLD:.2f}` safety | "
             f"**Generated**: `{report.generated_at}`"
         ),
         f"> {mode_banner}",
@@ -1367,12 +1458,17 @@ def render_proof_markdown(report: BenchmarkReport) -> str:
             f"+{(rm.slip_stress_survival_rate - bm.slip_stress_survival_rate) * 100:.1f} pp |"
         ),
         (
+            f"| **Managed Forge Carbon Escalations (`gemini-4-carbon`)** | "
+            f"n/a | `{rm.carbon_escalations_count}/{rm.total_scenarios}` | "
+            f"{'deep mode' if report.deep else 'auto-escalate on 2x fail'} |"
+        ),
+        (
             f"| **Mean End-to-End Latency** | "
             f"{bm.mean_latency_s:.3f}s | {rm.mean_latency_s:.3f}s | "
             f"{(rm.mean_latency_s - bm.mean_latency_s):+.3f}s |"
         ),
         (
-            "| **Decisions API Output Tokens** | "
+            "| **Decisions API Output Tokens (`v1beta`)** | "
             "n/a (no gate) | **0** (`gemini-decision-1`) | 0 tokens |"
         ),
         "",
@@ -1397,11 +1493,12 @@ def render_proof_markdown(report: BenchmarkReport) -> str:
                 f"clip={b.joint_clipping_count} · fid={_fmt_opt_float(b.fidelity_score)}"
             )
         )
+        carbon_badge = " · `carbon`" if r.escalated_to_carbon else ""
         robo_cell = (
             f"`{r.status}` ({r.error})"
             if r.error
             else (
-                f"`{r.route}` / `{r.adaptation_mode}` · "
+                f"`{r.route}` / `{r.adaptation_mode}`{carbon_badge} · "
                 f"{r.static_peak_tilt_deg:.1f}°→{r.observed_peak_tilt_deg:.1f}° · "
                 f"clip={r.joint_clipping_count} · fid={_fmt_opt_float(r.fidelity_score)} · "
                 f"conf={_fmt_opt_float(r.decision_confidence)}"
@@ -1428,7 +1525,10 @@ def render_proof_markdown(report: BenchmarkReport) -> str:
     sections: tuple[tuple[str, str], ...] = (
         ("execution_failure", "### 1. Execution & Safety Failures"),
         ("sim_to_real_slip_stress", "### 2. Sim-to-Real Table Slip Stress (`1.45x` Multiplier)"),
-        ("borderline_confidence", "### 3. Borderline Confidence Escalations (`< 0.70`)"),
+        (
+            "borderline_confidence",
+            f"### 3. Borderline Confidence Escalations (`< {DECISION_CONFIDENCE_THRESHOLD:.2f}`)",
+        ),
         ("fidelity_ceiling", "### 4. Fidelity Ceilings on Adapted & Impossible Moves"),
     )
 
@@ -1457,9 +1557,15 @@ def render_proof_markdown(report: BenchmarkReport) -> str:
             "  --output PROOF_IT_WORKS.md \\",
             "  --json-out benchmarks/eval_results.json",
             "",
-            "# Live 4-model Gemini 4 benchmark (requires GEMINI_API_KEY)",
+            "# Live 4-model Dual-Client (v1 + v1beta) benchmark (requires GEMINI_API_KEY)",
             "uv run python benchmarks/eval_5sigma.py \\",
             "  --mode live \\",
+            "  --output PROOF_IT_WORKS.md \\",
+            "  --json-out benchmarks/eval_results.json",
+            "",
+            "# Live deep benchmark routing Managed Forge directly to gemini-4-carbon",
+            "uv run python benchmarks/eval_5sigma.py \\",
+            "  --mode live --deep \\",
             "  --output PROOF_IT_WORKS.md \\",
             "  --json-out benchmarks/eval_results.json",
             "```",
@@ -1501,6 +1607,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=("offline", "live"),
         default="offline",
         help="Evaluation mode: deterministic 'offline' or live Gemini 4 API 'live'.",
+    )
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Route Managed Agent Skill Forge directly to gemini-4-carbon (live mode).",
     )
     parser.add_argument(
         "--output",
@@ -1546,13 +1657,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     settings = RoboHarnessSettings.from_env()
-    report = run_benchmark(
-        mode=args.mode,
-        scenario_ids=scenario_ids,
-        limit=args.limit,
-        settings=settings,
-        quiet=args.quiet,
-    )
+    try:
+        report = run_benchmark(
+            mode=args.mode,
+            scenario_ids=scenario_ids,
+            limit=args.limit,
+            deep=args.deep,
+            settings=settings,
+            quiet=args.quiet,
+        )
+    except RuntimeError as exc:
+        print(f"[5-sigma] ERROR: {exc}", file=sys.stderr, flush=True)
+        return 1
+
     md_path, js_path = write_report_artifacts(
         report,
         markdown_path=args.output,
