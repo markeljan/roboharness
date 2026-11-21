@@ -36,7 +36,12 @@ settings = RoboHarnessSettings.from_env()
 beta = make_dual_clients(settings.gemini_api_key).beta_client
 with TonypiMCPClient(settings.tonypi_mcp_url) as mcp:
     st = mcp.get_status()
-    img, _ = mcp.perceive()
+    frames = []
+    try:
+        img, _ = mcp.perceive()
+        frames = [img]
+    except Exception:
+        frames = []
 
 pose_seq = PoseSequence(
     source_description="Full airborne standing 360-degree backward somersault from table.",
@@ -72,7 +77,7 @@ skill = SkillArtifact(
     ),
 )
 t0 = time.perf_counter()
-gate = evaluate_pre_execution(beta, skill, pose_seq, [img], st)
+gate = evaluate_pre_execution(beta, skill, pose_seq, frames, st)
 ms = int((time.perf_counter() - t0) * 1000)
 print(f"  Model:      gemini-decision-1 (v1beta, 0 output tokens, {ms} ms)")
 print(f"  Robot IMU:  battery={st.battery_v:.2f}V, temp={st.max_servo_temp_c:.1f}C, standing={st.standing}")
