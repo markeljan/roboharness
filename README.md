@@ -24,9 +24,10 @@ flowchart LR
     Latch --> Store["Signed Skill Library<br/>skills/&lt;name&gt;.json (SHA-256)"]
     Store --> Reflex["v1: gemini-4-hydrogen (medium)<br/>Live Reflex Speech"]
     Reflex --> MCP["Streamable HTTP MCP Boundary<br/>TONYPI_MCP_URL (127.0.0.1:8765/mcp)"]
-    MCP --> Robot["Hiwonder TonyPi / MockTonypiMCPServer"]
+    MCP --> Robot["Hiwonder TonyPi / MuJoCo 4.0.1 Studio MCP / Mock"]
     Robot -. "Post-Run Frame + IMU" .-> Gate
-    Latch -. "Live Events" .-> SSE["Minimal SSE Telemetry Strip<br/>127.0.0.1:8770"]
+    Robot -. "3D Web Viewer + SimHistory" .-> Studio["MuJoCo 4.0.1 Studio<br/>http://localhost:8080/<br/>(Filament/WASM + Dear ImGui)"]
+    Latch -. "Live Events + Viewport" .-> SSE["Minimal SSE Telemetry Strip<br/>127.0.0.1:8770"]
 ```
 
 ---
@@ -75,7 +76,8 @@ LLMs never command servos without passing deterministic, non-LLM physics and har
 - **Net-New Implementation**: All code in this repository is written from scratch.
 - **External Hardware Driver Only**: [`markeljan/tonypi`](https://github.com/markeljan/tonypi) is treated strictly as an unchanged external MIT hardware driver reached **only** over Streamable HTTP MCP (`TONYPI_MCP_URL`, default `http://127.0.0.1:8765/mcp`).
 - **Zero Mocked Live Paths**: Passing `--mock` only swaps in [`MockTonypiMCPServer`](src/roboharness/mock_mcp.py) for hardware; Gemini API calls remain live and fail loudly if `GEMINI_API_KEY` is unset. Offline CI/tests require passing `--offline` explicitly.
-- **No Streamlit**: Passing `--ui` launches a minimal stdlib SSE telemetry strip at `http://127.0.0.1:8770` ([`src/roboharness/telemetry_sse.py`](src/roboharness/telemetry_sse.py)) designed to stay visually subordinate to the physical robot.
+- **MuJoCo 4.0.1 + MuJoCo Studio**: Run `uv sync --extra sim` and `uv run roboharness sim-server` to launch our clean-room [`MujocoTonypiMCPServer`](src/roboharness/mujoco_mcp_server.py) (`http://127.0.0.1:8765/mcp`) paired with **MuJoCo 4.0.1 Studio** (`--studio-gfx web` at `http://localhost:8080/` or `--studio-gfx native`) featuring Filament/WASM PBR rendering, `SimHistory` timeline scrubbing, and our custom Dear ImGui **"RoboHarness Telemetry"** overlay ([`src/roboharness/studio_plugin.py`](src/roboharness/studio_plugin.py)), plus live `/stream.mjpeg` & `/frame.jpg`.
+- **No Streamlit**: Passing `--ui` launches a minimal stdlib SSE telemetry strip + live camera viewport at `http://127.0.0.1:8770` ([`src/roboharness/telemetry_sse.py`](src/roboharness/telemetry_sse.py)) designed to stay visually subordinate to the physical robot.
 
 ---
 
@@ -83,7 +85,7 @@ LLMs never command servos without passing deterministic, non-LLM physics and har
 
 ### 1. Install & Configure
 ```bash
-uv sync
+uv sync --extra sim
 export GEMINI_API_KEY="your-gemini-api-key"
 # Optional: TonyPi MCP server (defaults to http://127.0.0.1:8765/mcp)
 export TONYPI_MCP_URL="http://127.0.0.1:8765/mcp"
@@ -92,7 +94,17 @@ export GEMINI_ENVIRONMENT_ID="env-..."
 ```
 *(A local `.env` file in the repo root is auto-loaded by `RoboHarnessSettings.from_env()` without overriding exported shell variables.)*
 
-### 2. Pre-Flight Check & Managed Agent Setup
+### 2. Optional: Launch Clean-Room MuJoCo 4.0.1 Studio + MCP Simulator
+```bash
+# Starts Streamable HTTP MCP (:8765/mcp), live MJPEG (:8765/stream.mjpeg), and
+# MuJoCo 4.0.1 Studio 3D Web Viewer (http://localhost:8080/) with SimHistory + RoboHarness Telemetry panel
+uv run roboharness sim-server --studio-gfx web --studio-port 8080 --open-browser
+
+# Or native Studio window (`--studio-gfx native`) / headless (`--studio-gfx none`)
+uv run python -m roboharness.mujoco_mcp_server --studio-gfx web --studio-port 8080
+```
+
+### 3. Pre-Flight Check & Managed Agent Setup
 ```bash
 # Verify v1 + v1beta Gemini models & TONYPI_MCP_URL (add --mock if hardware is offline)
 uv run roboharness check
@@ -101,7 +113,7 @@ uv run roboharness check
 uv run roboharness forge-setup --deep
 ```
 
-### 3. Live Demo: Mimic Any Video, Replay, & Debug Trials
+### 4. Live Demo: Mimic Any Video, Replay, & Debug Trials
 ```bash
 # Live 5-second webcam recording of a judge + minimal SSE telemetry strip on :8770
 uv run roboharness mimic --webcam 5 --name judge_wave --ui
@@ -119,7 +131,7 @@ uv run roboharness list
 uv run roboharness debug-video --video trial.mp4 --name floss --expected "Stable hips and alternating arm swing"
 ```
 
-### 4. Fast Offline CI & Benchmark (Zero Hardware, Zero API Keys)
+### 5. Fast Offline CI & Benchmark (Zero Hardware, Zero API Keys)
 ```bash
 # Run the full offline test suite
 uv run pytest -q
@@ -170,9 +182,11 @@ roboharness/
 │   ├── decision_gate.py             # v1beta 0-output-token gemini-decision-1 gates (>=0.75)
 │   ├── skill_store.py               # Atomic SHA-256 verified skills/<name>.json library
 │   ├── mcp_client.py                # Streamable HTTP MCP JSON-RPC 2.0 client
+│   ├── mujoco_mcp_server.py         # Clean-room MuJoCo 4.0.1 Studio + Streamable HTTP MCP server
+│   ├── studio_plugin.py             # Dear ImGui "RoboHarness Telemetry" plugin for MuJoCo 4 Studio
 │   ├── mock_mcp.py                  # Deterministic offline MockTonypiMCPServer + fault injection
 │   ├── capture.py                   # macOS avfoundation webcam capture & preview frames
-│   ├── telemetry_sse.py             # Minimal stdlib SSE status strip (127.0.0.1:8770)
+│   ├── telemetry_sse.py             # Minimal stdlib SSE status strip + live viewport (127.0.0.1:8770)
 │   └── pipeline.py                  # End-to-end MimicPipeline + pre-flight checks
 └── tests/                           # Fast offline unit, e2e, CLI, eval, and AST invariant tests
 ```

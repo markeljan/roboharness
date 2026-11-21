@@ -23,12 +23,15 @@ from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import httpx
 from PIL import Image
 
 from roboharness.schemas import JOINTS_BY_ID, JOINTS_BY_NAME, NEUTRAL_POSE, TONYPI_JOINTS
+
+StudioMode = Literal["web", "native"]
+StudioGfxOption = Literal["web", "native", "none"]
 
 DEFAULT_MUJOCO_XML: Path = (
     Path.home() / ".local" / "share" / "tonypi" / "simulation" / "PAB47-TonyPi" / "model" / "scene.xml"
@@ -181,7 +184,7 @@ class _DedicatedRenderWorker:
 
 
 class MujocoTonypiMCPServer:
-    """Clean-room MuJoCo 3.x physics + Streamable HTTP MCP server for TonyPi."""
+    """Clean-room MuJoCo 4.0.1 physics + Studio + Streamable HTTP MCP server for TonyPi."""
 
     def __init__(
         self,
@@ -189,6 +192,7 @@ class MujocoTonypiMCPServer:
         xml_path: Path | str | None = None,
         friction: float = 1.0,
         session_id: str = "mujoco-tonypi-session-001",
+        studio_realtime: bool = True,
     ) -> None:
         import mujoco
 
@@ -219,6 +223,7 @@ class MujocoTonypiMCPServer:
         self._friction_scale = float(friction)
         self._battery_v = 11.7
         self._max_servo_temp_c = 36.5
+        self._active_skill: str = "idle"
 
         self.spoken_texts: list[str] = []
         self.call_log: list[dict[str, Any]] = []
@@ -235,8 +240,98 @@ class MujocoTonypiMCPServer:
         self._thread: threading.Thread | None = None
         self._base_url: str | None = None
 
+        self._studio_handle: Any | None = None
+        self._studio_plugin: Any | None = None
+        self.studio_url: str | None = None
+        self.studio_realtime: bool = bool(studio_realtime)
+        self.studio_sync_count: int = 0
+
         with self.lock:
             self._reset_locked(friction=self._friction_scale)
+
+    def start_studio(
+        self,
+        mode: StudioMode = "web",
+        port: int = 8080,
+        open_browser: bool = False,
+        *,
+        realtime: bool | None = None,
+    ) -> str:
+        """Launch MuJoCo 4.0.1 Studio (WebAssembly Filament or Native) with RoboHarness plugin."""
+        if self._studio_handle is not None and self.studio_url is not None:
+            return self.studio_url
+
+        from mujoco.studio import app as studio_app
+        from mujoco.studio import launch_native, launch_web, sim_history, viewer_protocol
+
+        from roboharness.studio_plugin import RoboHarnessStudioPlugin
+
+        if realtime is not None:
+            self.studio_realtime = bool(realtime)
+
+        self._studio_plugin = RoboHarnessStudioPlugin()
+        plugins = [studio_app.App(), sim_history.SimHistory(), self._studio_plugin]
+
+        if mode == "web":
+            cfg = viewer_protocol.ViewerConfig(
+                title="RoboHarness — TonyPi MuJoCo 4 Studio",
+                gfx="web",
+                http_port=int(port),
+                open_browser=bool(open_browser),
+            )
+            handle = launch_web.launch(cfg, plugins=plugins)
+            studio_url = f"http://localhost:{int(port)}/"
+        elif mode == "native":
+            cfg = viewer_protocol.ViewerConfig(
+                title="RoboHarness — TonyPi MuJoCo 4 Studio",
+                gfx="",
+                open_browser=False,
+            )
+            handle = launch_native.launch(cfg, plugins=plugins)
+            studio_url = "native://mujoco-studio"
+        else:
+            raise ValueError(f"Unsupported Studio mode '{mode}'; expected 'web' or 'native'.")
+
+        with self.lock:
+            self._studio_handle = handle
+            self.studio_url = studio_url
+            handle.set_model(self.model, str(self.xml_path), self.data)
+            self._sync_studio_locked(
+                skill_name=self._active_skill,
+                status_label="READY",
+                safety_ok=True,
+            )
+        return studio_url
+
+    def stop_studio(self) -> None:
+        """Close the active MuJoCo 4.0.1 Studio viewer handle cleanly."""
+        with self.lock:
+            handle = self._studio_handle
+            self._studio_handle = None
+            self.studio_url = None
+        if handle is not None:
+            handle.close()
+
+    def _sync_studio_locked(
+        self,
+        *,
+        skill_name: str,
+        status_label: str,
+        safety_ok: bool,
+    ) -> None:
+        _, _, tilt_deg = _quat_to_euler_and_tilt_deg(self.data.qpos[3:7])
+        if self._studio_plugin is not None:
+            self._studio_plugin.update_telemetry(
+                skill_name=skill_name,
+                tilt_deg=tilt_deg,
+                contacts=int(self.data.ncon),
+                friction=self._friction_scale,
+                status_label=status_label,
+                safety_ok=safety_ok,
+            )
+        if self._studio_handle is not None:
+            self._studio_handle.sync(self.model, self.data)
+            self.studio_sync_count += 1
 
     def __enter__(self) -> Self:
         return self
@@ -297,11 +392,14 @@ class MujocoTonypiMCPServer:
             "servo_positions": self._current_servo_positions_locked(),
             "sim": True,
             "friction": round(self._friction_scale, 3),
+            "mujoco_version": str(self._mujoco.__version__),
+            "studio_url": self.studio_url,
         }
 
     def _reset_locked(self, *, friction: float = 1.0) -> dict[str, Any]:
         mujoco = self._mujoco
         self._friction_scale = max(0.01, float(friction))
+        self._active_skill = "idle"
         self.model.geom_friction[self._floor_geom_id, 0] = (
             self._base_floor_friction * self._friction_scale
         )
@@ -316,6 +414,11 @@ class MujocoTonypiMCPServer:
             mujoco.mj_step(self.model, self.data)
 
         self._update_latest_jpeg_locked()
+        self._sync_studio_locked(
+            skill_name="idle",
+            status_label="RESET / STANDING",
+            safety_ok=True,
+        )
         return self._status_locked()
 
     def _play_frames_locked(
@@ -325,10 +428,14 @@ class MujocoTonypiMCPServer:
         hold_s: float = 0.5,
         guard_tilt_deg: float | None = 30.0,
         render_final: bool = True,
+        skill_name: str = "play_frames",
     ) -> dict[str, Any]:
         mujoco = self._mujoco
         dt = float(self.model.opt.timestep)
         render_interval_steps = max(1, round(0.08 / dt))
+        studio_interval_steps = max(1, round(0.03 / dt))
+        studio_interval_s = studio_interval_steps * dt
+        self._active_skill = skill_name
 
         _, _, init_tilt = _quat_to_euler_and_tilt_deg(self.data.qpos[3:7])
         peak_tilt = init_tilt
@@ -338,6 +445,8 @@ class MujocoTonypiMCPServer:
         abort_reason: str | None = None
         fell = False
         steps_since_render = 0
+        steps_since_studio = 0
+        last_studio_wall = time.perf_counter()
 
         for idx, frame in enumerate(frames):
             if not isinstance(frame, dict):
@@ -369,6 +478,7 @@ class MujocoTonypiMCPServer:
                 self.data.ctrl[:] = start_ctrl + alpha * (target_ctrl - start_ctrl)
                 mujoco.mj_step(self.model, self.data)
                 steps_since_render += 1
+                steps_since_studio += 1
 
                 _, _, tilt_deg = _quat_to_euler_and_tilt_deg(self.data.qpos[3:7])
                 base_z = float(self.data.qpos[2])
@@ -380,6 +490,19 @@ class MujocoTonypiMCPServer:
                 if steps_since_render >= render_interval_steps:
                     self._update_latest_jpeg_locked()
                     steps_since_render = 0
+
+                if steps_since_studio >= studio_interval_steps:
+                    self._sync_studio_locked(
+                        skill_name=skill_name,
+                        status_label=f"FRAME {idx + 1}/{len(frames)}",
+                        safety_ok=not aborted and not fell and tilt_deg < 30.0,
+                    )
+                    steps_since_studio = 0
+                    if self._studio_handle is not None and self.studio_realtime:
+                        elapsed = time.perf_counter() - last_studio_wall
+                        if elapsed < studio_interval_s:
+                            time.sleep(studio_interval_s - elapsed)
+                        last_studio_wall = time.perf_counter()
 
                 if guard_tilt_deg is not None and tilt_deg >= float(guard_tilt_deg):
                     aborted = True
@@ -400,6 +523,7 @@ class MujocoTonypiMCPServer:
             for _ in range(hold_steps):
                 mujoco.mj_step(self.model, self.data)
                 steps_since_render += 1
+                steps_since_studio += 1
                 _, _, tilt_deg = _quat_to_euler_and_tilt_deg(self.data.qpos[3:7])
                 base_z = float(self.data.qpos[2])
                 peak_tilt = max(peak_tilt, tilt_deg)
@@ -409,6 +533,18 @@ class MujocoTonypiMCPServer:
                 if steps_since_render >= render_interval_steps:
                     self._update_latest_jpeg_locked()
                     steps_since_render = 0
+                if steps_since_studio >= studio_interval_steps:
+                    self._sync_studio_locked(
+                        skill_name=skill_name,
+                        status_label="SETTLING",
+                        safety_ok=not aborted and not fell and tilt_deg < 30.0,
+                    )
+                    steps_since_studio = 0
+                    if self._studio_handle is not None and self.studio_realtime:
+                        elapsed = time.perf_counter() - last_studio_wall
+                        if elapsed < studio_interval_s:
+                            time.sleep(studio_interval_s - elapsed)
+                        last_studio_wall = time.perf_counter()
                 if guard_tilt_deg is not None and tilt_deg >= float(guard_tilt_deg):
                     aborted = True
                     abort_reason = (
@@ -425,6 +561,12 @@ class MujocoTonypiMCPServer:
         status = self._status_locked()
         if not status["standing"]:
             fell = True
+
+        self._sync_studio_locked(
+            skill_name=skill_name,
+            status_label="ABORTED" if aborted else ("FELL" if fell else "COMPLETE"),
+            safety_ok=not aborted and not fell and status["tilt_deg"] < 30.0,
+        )
 
         return {
             "ok": not aborted and not fell,
@@ -568,11 +710,13 @@ class MujocoTonypiMCPServer:
             hold_s = float(arguments.get("hold_s", 0.5))
             guard_raw = arguments.get("guard_tilt_deg", 30.0)
             guard_tilt = None if guard_raw is None else float(guard_raw)
+            skill_label = str(arguments.get("name") or arguments.get("skill_name") or "play_frames")
             payload = self._play_frames_locked(
                 frames,
                 hold_s=hold_s,
                 guard_tilt_deg=guard_tilt,
                 render_final=True,
+                skill_name=skill_label,
             )
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -588,6 +732,7 @@ class MujocoTonypiMCPServer:
                 hold_s=hold_s,
                 guard_tilt_deg=30.0,
                 render_final=True,
+                skill_name="set_pose",
             )
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -610,6 +755,7 @@ class MujocoTonypiMCPServer:
                 hold_s=settle_s,
                 guard_tilt_deg=None,
                 render_final=render,
+                skill_name="simulate_motion",
             )
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -750,7 +896,13 @@ class MujocoTonypiMCPServer:
                 path = self.path.split("?", 1)[0]
                 if path == "/health":
                     body = json.dumps(
-                        {"ok": True, "sim": True, "xml": str(server_ref.xml_path)}
+                        {
+                            "ok": True,
+                            "sim": True,
+                            "xml": str(server_ref.xml_path),
+                            "mujoco_version": str(server_ref._mujoco.__version__),
+                            "studio_url": server_ref.studio_url,
+                        }
                     ).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -835,11 +987,12 @@ class MujocoTonypiMCPServer:
             thread.join(timeout=2.0)
 
     def stop(self) -> None:
-        """Stop the HTTP server, wake MJPEG listeners, and close the MuJoCo renderer safely."""
+        """Stop HTTP, close MuJoCo 4.0.1 Studio, wake MJPEG listeners, and close renderer."""
         with self._frame_cond:
             self._closed = True
             self._frame_cond.notify_all()
         self.stop_http()
+        self.stop_studio()
         self._renderer.close()
 
 
@@ -849,16 +1002,40 @@ def run_server(
     viewer: bool = False,
     friction: float = 1.0,
     xml_path: Path | str | None = None,
+    *,
+    studio_gfx: StudioGfxOption = "web",
+    studio_port: int = 8080,
+    open_browser: bool = False,
 ) -> None:
-    """Run the clean-room MuJoCo TonyPi MCP server (with optional 3D passive viewer)."""
-    server = MujocoTonypiMCPServer(xml_path=xml_path, friction=friction)
+    """Run the clean-room MuJoCo 4.0.1 TonyPi MCP server with optional MuJoCo Studio."""
+    effective_gfx: StudioGfxOption = "native" if (viewer and studio_gfx == "web") else studio_gfx
+    server = MujocoTonypiMCPServer(
+        xml_path=xml_path,
+        friction=friction,
+        studio_realtime=effective_gfx != "none",
+    )
     mcp_url = server.start_http(host=host, port=port)
-    print(f"RoboHarness MuJoCo MCP server listening on {mcp_url}", flush=True)
+
+    studio_url: str | None = None
+    if effective_gfx in ("web", "native"):
+        studio_url = server.start_studio(
+            mode=effective_gfx,
+            port=studio_port,
+            open_browser=open_browser,
+            realtime=True,
+        )
+
+    print(
+        f"RoboHarness MuJoCo {server._mujoco.__version__} MCP server listening on {mcp_url}",
+        flush=True,
+    )
+    if studio_url:
+        print(f"MuJoCo 4 Studio 3D Viewer ({effective_gfx}): {studio_url}", flush=True)
     print(f"Live MJPEG stream: {server.stream_url}", flush=True)
     print(f"Latest snapshot:   {server.frame_url}", flush=True)
 
     try:
-        if viewer:
+        if viewer and effective_gfx == "none":
             import mujoco.viewer
 
             with mujoco.viewer.launch_passive(server.model, server.data) as v:
@@ -868,7 +1045,9 @@ def run_server(
                     time.sleep(1.0 / 30.0)
         else:
             while True:
-                time.sleep(0.5)
+                if server._studio_handle is not None and not server._studio_handle.is_running():
+                    break
+                time.sleep(0.25)
     except KeyboardInterrupt:
         pass
     finally:
@@ -878,14 +1057,31 @@ def run_server(
 def main(argv: list[str] | None = None) -> None:
     """CLI entrypoint for `python -m roboharness.mujoco_mcp_server`."""
     parser = argparse.ArgumentParser(
-        description="Run the clean-room MuJoCo Streamable HTTP MCP server for TonyPi."
+        description="Run the clean-room MuJoCo 4.0.1 Studio + Streamable HTTP MCP server for TonyPi."
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
     parser.add_argument(
+        "--studio-gfx",
+        choices=("web", "native", "none"),
+        default="web",
+        help="MuJoCo 4.0.1 Studio mode: web (Filament/WASM), native, or none (default: web).",
+    )
+    parser.add_argument(
+        "--studio-port",
+        type=int,
+        default=8080,
+        help="MuJoCo 4.0.1 Studio Web Viewer port (default: 8080).",
+    )
+    parser.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="Automatically open MuJoCo 4.0.1 Studio Web Viewer in your default browser.",
+    )
+    parser.add_argument(
         "--viewer",
         action="store_true",
-        help="Open interactive 3D MuJoCo passive viewer on main thread (use `mjpython` on macOS).",
+        help="Legacy alias for native 3D viewer (--studio-gfx native).",
     )
     parser.add_argument(
         "--friction",
@@ -906,6 +1102,9 @@ def main(argv: list[str] | None = None) -> None:
         viewer=args.viewer,
         friction=args.friction,
         xml_path=args.xml,
+        studio_gfx=args.studio_gfx,
+        studio_port=args.studio_port,
+        open_browser=args.open_browser,
     )
 
 

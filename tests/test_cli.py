@@ -78,7 +78,15 @@ def test_cli_help_lists_all_commands_and_options() -> None:
 
     sim_help = runner.invoke(app, ["sim-server", "--help"])
     assert sim_help.exit_code == 0
-    for flag in ("--host", "--port", "--viewer", "--friction"):
+    for flag in (
+        "--host",
+        "--port",
+        "--studio-gfx",
+        "--studio-port",
+        "--open-browser",
+        "--viewer",
+        "--friction",
+    ):
         assert flag in sim_help.output
 
 

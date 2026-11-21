@@ -6,6 +6,7 @@ import base64
 import importlib.util
 import io
 import math
+import socket
 from collections.abc import Iterator
 
 import httpx
@@ -16,6 +17,7 @@ from roboharness.mcp_client import TonypiMCPClient
 from roboharness.mujoco_mcp_server import MujocoTonypiMCPServer, resolve_mujoco_xml_path
 from roboharness.safety import check_skill_keyframes, sign_skill_artifact
 from roboharness.schemas import NEUTRAL_POSE, ServoKeyframe, SkillArtifact
+from roboharness.studio_plugin import RoboHarnessStudioPlugin
 
 _HAS_MUJOCO = importlib.util.find_spec("mujoco") is not None
 _XML_PATH = resolve_mujoco_xml_path()
@@ -177,3 +179,76 @@ def test_mujoco_mcp_http_endpoints_health_frame_and_mcp(
             assert status.standing is True
     finally:
         mujoco_server.stop_http()
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def test_mujoco_4_studio_web_viewer_sync_and_plugin(
+    mujoco_server: MujocoTonypiMCPServer,
+) -> None:
+    import mujoco
+
+    major, minor, *_ = (int(part) for part in mujoco.__version__.split(".")[:2])
+    assert (major, minor) >= (4, 0), f"Expected MuJoCo >= 4.0, got {mujoco.__version__}"
+
+    plugin_probe = RoboHarnessStudioPlugin()
+    plugin_probe.update_telemetry(
+        skill_name="probe_wave",
+        tilt_deg=4.25,
+        contacts=8,
+        friction=0.75,
+        status_label="FRAME 1/3",
+        safety_ok=True,
+    )
+    snap = plugin_probe.snapshot()
+    assert snap.skill_name == "probe_wave"
+    assert snap.tilt_deg == pytest.approx(4.25, abs=0.01)
+    assert snap.contacts == 8
+    assert snap.friction == pytest.approx(0.75, abs=0.01)
+    assert snap.safety_ok is True
+
+    free_port = _find_free_port()
+    studio_url = mujoco_server.start_studio(
+        mode="web",
+        port=free_port,
+        open_browser=False,
+        realtime=False,
+    )
+    mcp_url = mujoco_server.start_http(host="127.0.0.1", port=0)
+    try:
+        assert studio_url == f"http://localhost:{free_port}/"
+        web_resp = httpx.get(f"http://127.0.0.1:{free_port}/", timeout=3.0)
+        assert web_resp.status_code == 200
+        assert len(web_resp.content) > 1000
+
+        base_url = mcp_url.removesuffix("/mcp")
+        health = httpx.get(f"{base_url}/health", timeout=2.0).json()
+        assert health["mujoco_version"] == mujoco.__version__
+        assert health["studio_url"] == studio_url
+
+        syncs_before = mujoco_server.studio_sync_count
+        skill = _make_arm_wave_skill()
+        with TonypiMCPClient(
+            "http://mujoco.local/mcp", transport=mujoco_server.as_httpx_transport()
+        ) as client:
+            status = client.get_status()
+            assert status.raw["mujoco_version"] == mujoco.__version__
+            assert status.raw["studio_url"] == studio_url
+
+            trace = client.execute_skill(skill)
+            assert trace.aborted is False
+            assert trace.peak_observed_tilt_deg < 10.0
+
+        assert mujoco_server.studio_sync_count > syncs_before + 5
+        assert mujoco_server._studio_plugin is not None
+        final_snap = mujoco_server._studio_plugin.snapshot()
+        assert final_snap.safety_ok is True
+        assert final_snap.tilt_deg < 10.0
+    finally:
+        mujoco_server.stop_http()
+        mujoco_server.stop_studio()
+        assert mujoco_server.studio_url is None

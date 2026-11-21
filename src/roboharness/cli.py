@@ -683,11 +683,34 @@ def sim_server(
         int,
         typer.Option("--port", min=1, max=65535, help="Bind port for the MuJoCo MCP HTTP server."),
     ] = 8765,
+    studio_gfx: Annotated[
+        str,
+        typer.Option(
+            "--studio-gfx",
+            help="MuJoCo 4.0.1 Studio viewer mode: web (Filament/WASM), native, or none.",
+        ),
+    ] = "web",
+    studio_port: Annotated[
+        int,
+        typer.Option(
+            "--studio-port",
+            min=1,
+            max=65535,
+            help="HTTP port for MuJoCo 4.0.1 Studio Web Viewer.",
+        ),
+    ] = 8080,
+    open_browser: Annotated[
+        bool,
+        typer.Option(
+            "--open-browser/--no-open-browser",
+            help="Open MuJoCo 4.0.1 Studio Web Viewer automatically in your browser.",
+        ),
+    ] = False,
     viewer: Annotated[
         bool,
         typer.Option(
             "--viewer/--no-viewer",
-            help="Launch interactive 3D MuJoCo passive viewer (use `mjpython` on macOS).",
+            help="Legacy alias for native 3D viewer (--studio-gfx native).",
         ),
     ] = False,
     friction: Annotated[
@@ -703,9 +726,19 @@ def sim_server(
         typer.Option("--xml", help="Optional path to TonyPi MuJoCo scene.xml asset."),
     ] = None,
 ) -> None:
-    """Launch the clean-room MuJoCo Streamable HTTP MCP server + live MJPEG stream."""
+    """Launch the clean-room MuJoCo 4.0.1 Studio + Streamable HTTP MCP server."""
     console = _console()
+    gfx_norm = studio_gfx.strip().lower()
+    if gfx_norm not in ("web", "native", "none"):
+        console.print(
+            f"[bold red]Error:[/bold red] Invalid --studio-gfx {studio_gfx!r}; "
+            "expected 'web', 'native', or 'none'."
+        )
+        raise typer.Exit(code=2)
+
     try:
+        import mujoco
+
         from roboharness.mujoco_mcp_server import run_server
     except ImportError as exc:
         console.print(
@@ -714,21 +747,46 @@ def sim_server(
         )
         raise typer.Exit(code=1) from exc
 
+    effective_gfx = "native" if (viewer and gfx_norm == "web") else gfx_norm
+    if effective_gfx == "web":
+        studio_line = (
+            f"[bold cyan]MuJoCo {mujoco.__version__} Studio 3D Web Viewer:[/bold cyan] "
+            f"http://localhost:{studio_port}/ "
+            "(Filament/WASM + Dear ImGui + SimHistory + RoboHarness Telemetry)"
+        )
+    elif effective_gfx == "native":
+        studio_line = (
+            f"[bold cyan]MuJoCo {mujoco.__version__} Studio Native Viewer:[/bold cyan] "
+            "native window (Dear ImGui + SimHistory + RoboHarness Telemetry)"
+        )
+    else:
+        studio_line = f"[bold]MuJoCo {mujoco.__version__} Studio:[/bold] disabled (--studio-gfx none)"
+
     info_lines = [
-        f"[bold]MCP Endpoint:[/bold] http://{host}:{port}/mcp",
+        studio_line,
+        f"[bold]Streamable HTTP MCP:[/bold] http://{host}:{port}/mcp",
         f"[bold]Live MJPEG Stream:[/bold] http://{host}:{port}/stream.mjpeg",
         f"[bold]Latest Snapshot:[/bold] http://{host}:{port}/frame.jpg",
         f"[bold]Floor Friction Scale:[/bold] {friction:.2f}x",
-        (
-            "[dim]macOS 3D interactive viewer tip: "
-            f"uv run mjpython -m roboharness.mujoco_mcp_server --port {port} --viewer[/dim]"
-        ),
     ]
     console.print(
-        Panel("\n".join(info_lines), title="RoboHarness MuJoCo MCP Server", border_style="cyan")
+        Panel(
+            "\n".join(info_lines),
+            title=f"RoboHarness MuJoCo {mujoco.__version__} Studio & MCP Server",
+            border_style="cyan",
+        )
     )
     try:
-        run_server(host=host, port=port, viewer=viewer, friction=friction, xml_path=xml)
+        run_server(
+            host=host,
+            port=port,
+            viewer=viewer,
+            friction=friction,
+            xml_path=xml,
+            studio_gfx=effective_gfx,  # type: ignore[arg-type]
+            studio_port=studio_port,
+            open_browser=open_browser,
+        )
     except (FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
         console.print(f"[bold red]MuJoCo server error:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc

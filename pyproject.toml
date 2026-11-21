@@ -31,7 +31,7 @@ roboharness = "roboharness.cli:app"
 
 [project.optional-dependencies]
 sim = [
-    "mujoco>=3.17,<3.18",
+    "mujoco>=4.0.1",
 ]
 
 [tool.hatch.build.targets.wheel]
