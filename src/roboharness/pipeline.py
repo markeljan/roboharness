@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -553,6 +554,15 @@ class MimicPipeline:
             safety_prob_threshold=self.settings.decision_safety_prob_threshold,
         )
 
+    @staticmethod
+    def _audio_muted() -> bool:
+        return os.environ.get("ROBOHARNESS_MUTE_AUDIO", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     def _make_announcement(
         self,
         skill_name: str,
@@ -561,8 +571,8 @@ class MimicPipeline:
         frame_jpeg: bytes | None,
     ) -> str:
         fallback = f"Performing verified skill {skill_name} now."
-        if self.offline_mode:
-            return fallback
+        if self.offline_mode or self._audio_muted():
+            return f"[muted] {fallback}" if self._audio_muted() else fallback
         v1_client, _ = self._require_live_clients()
         try:
             return run_live_reflex_announcement(
@@ -577,7 +587,7 @@ class MimicPipeline:
             return fallback
 
     def _safe_say(self, text: str) -> None:
-        if not text:
+        if not text or self._audio_muted():
             return
         try:
             self.mcp.say(text)
