@@ -4,6 +4,23 @@
 
 Built clean-room for the **Gemini 4 NYC Hackathon** (*Problem Statement One: "5 Sigma"* + *Best Use of Managed Agents*), RoboHarness watches **any** short human video — a live 5-second webcam recording of a judge or an uploaded MP4 (e.g., a Fortnite dance) — analyzes it with **Agentic Video Processing** (`processing="agentic"`), retargets and physics-verifies 16-DOF trajectories inside a forked Google Managed Agent sandbox (`gemini-4-neon` with automatic escalation to `gemini-4-carbon`), gates safety and fidelity with the **0-output-token Decisions API** (`confidence >= 0.75` and `is_physically_safe >= 0.75`), saves SHA-256 signed reusable skills, and executes live on a physical TonyPi robot exclusively over **Streamable HTTP MCP**.
 
+> **1-Minute Demo Video**: _YouTube link dropping shortly — live physical Hiwonder TonyPi + MuJoCo 4.0.1 Studio demo_
+
+### Judge Quick-Scan — Headline Live 5 Sigma Proof
+
+Live 12-scenario evaluation on real Gemini 4 Dual-Client APIs (`v1` + `v1beta`) and real MuJoCo 3D physics MCP (`friction=1.0` nominal / `friction=0.25` slip stress) — full breakdown and **Honest Failure Ledger** in [`PROOF_IT_WORKS.md`](PROOF_IT_WORKS.md) ([raw JSON](benchmarks/eval_results.json)):
+
+| Metric (12 Unseen Scenarios, Live MuJoCo MCP) | Baseline A (Single-Shot) | Full RoboHarness | Delta |
+| :--- | :---: | :---: | :---: |
+| **Physical Safety Pass Rate** | 4/12 (33.3%) | **11/12 (91.7%)** | **+58.3 pp** |
+| **Real MuJoCo Falls (`fell=True`)** | 6 / 12 | **0 / 12** | **-6 falls** |
+| **`0.25x` Low-Friction Slip Survival** | 0/2 (0.0%) | **2/2 (100.0%)** | **+100.0 pp** |
+| **Impossible-Move Safe Refusal** | 0/3 (0.0%) | **2/3 (66.7%)** | **+66.7 pp** |
+| **Mean Fidelity (Executable, 0–3)** | 1.30 / 3.00 | **2.20 / 3.00** | **+0.89** |
+| **Decisions API Output Tokens (`v1beta`)** | n/a | **0** | **0 tokens** |
+
+*Offline verification: **141/141 tests passing** (`uv run pytest -q`, zero hardware or API keys required) · **0 ruff lint issues** · **MIT Licensed** ([`LICENSE`](LICENSE)).*
+
 ---
 
 ## Architecture
@@ -76,7 +93,7 @@ LLMs never command servos without passing deterministic, non-LLM physics and har
 - **Net-New Implementation**: All code in this repository is written from scratch.
 - **External Hardware Driver Only**: [`markeljan/tonypi`](https://github.com/markeljan/tonypi) is treated strictly as an unchanged external MIT hardware driver reached **only** over Streamable HTTP MCP (`TONYPI_MCP_URL`, default `http://127.0.0.1:8765/mcp`).
 - **Zero Mocked Live Paths**: Passing `--mock` only swaps in [`MockTonypiMCPServer`](src/roboharness/mock_mcp.py) for hardware; Gemini API calls remain live and fail loudly if `GEMINI_API_KEY` is unset. Offline CI/tests require passing `--offline` explicitly.
-- **MuJoCo 4.0.1 + MuJoCo Studio**: Run `uv sync --extra sim` and `uv run roboharness sim-server` to launch our clean-room [`MujocoTonypiMCPServer`](src/roboharness/mujoco_mcp_server.py) (`http://127.0.0.1:8765/mcp`) paired with **MuJoCo 4.0.1 Studio** (`--studio-gfx web` at `http://localhost:8080/` or `--studio-gfx native`) featuring Filament/WASM PBR rendering, `SimHistory` timeline scrubbing, and our custom Dear ImGui **"RoboHarness Telemetry"** overlay ([`src/roboharness/studio_plugin.py`](src/roboharness/studio_plugin.py)), plus live `/stream.mjpeg` & `/frame.jpg`.
+- **MuJoCo 4.0.1 + MuJoCo Studio**: Run `uv sync --extra sim` (plus `uv pip install mujoco-studio mujoco-studio-wasm` if launching the Studio Web Viewer) and `uv run roboharness sim-server` to launch our clean-room [`MujocoTonypiMCPServer`](src/roboharness/mujoco_mcp_server.py) (`http://127.0.0.1:8765/mcp`) paired with **MuJoCo 4.0.1 Studio** (`--studio-gfx web` at `http://localhost:8080/` or `--studio-gfx native`) featuring Filament/WASM PBR rendering, `SimHistory` timeline scrubbing, and our custom Dear ImGui **"RoboHarness Telemetry"** overlay ([`src/roboharness/studio_plugin.py`](src/roboharness/studio_plugin.py)), plus live `/stream.mjpeg` & `/frame.jpg`.
 - **No Streamlit**: Passing `--ui` launches a minimal stdlib SSE telemetry strip + live camera viewport at `http://127.0.0.1:8770` ([`src/roboharness/telemetry_sse.py`](src/roboharness/telemetry_sse.py)) designed to stay visually subordinate to the physical robot.
 
 ---
@@ -86,13 +103,15 @@ LLMs never command servos without passing deterministic, non-LLM physics and har
 ### 1. Install & Configure
 ```bash
 uv sync --extra sim
+# Optional: add Studio Web Viewer packages if launching `--studio-gfx web`
+# uv pip install mujoco-studio mujoco-studio-wasm
 export GEMINI_API_KEY="your-gemini-api-key"
 # Optional: TonyPi MCP server (defaults to http://127.0.0.1:8765/mcp)
 export TONYPI_MCP_URL="http://127.0.0.1:8765/mcp"
 # Optional: self-hosted Docker/MuJoCo sandbox environment ID (defaults to "remote")
 export GEMINI_ENVIRONMENT_ID="env-..."
 ```
-*(A local `.env` file in the repo root is auto-loaded by `RoboHarnessSettings.from_env()` without overriding exported shell variables.)*
+*(Copy [`.env.example`](.env.example) to `.env` — `RoboHarnessSettings.from_env()` auto-loads `.env` without overriding exported shell variables.)*
 
 ### 2. Optional: Launch Clean-Room MuJoCo 4.0.1 Studio + MCP Simulator
 ```bash
@@ -144,13 +163,13 @@ uv run roboharness mimic --video clip.mp4 --name demo_wave --mock --offline
 
 ## 5 Sigma Proof Engine & Governance
 
-- **[`PROOF_IT_WORKS.md`](PROOF_IT_WORKS.md)** — Quantitative 12-scenario evaluation across 4 categories (3 Dances, 3 Gestures, 3 Asymmetric Poses, 3 Impossible Moves + sim-to-real `1.45x` table-slip stress tests) comparing **Baseline A** (single-shot `gemini-4-hydrogen`) against **Full RoboHarness**, complete with an **Honest Failure Ledger**.
+- **[`PROOF_IT_WORKS.md`](PROOF_IT_WORKS.md)** ([raw JSON](benchmarks/eval_results.json)) — Quantitative 12-scenario evaluation across 4 categories (3 Dances, 3 Gestures, 3 Asymmetric Poses, 3 Impossible Moves + sim-to-real `friction=0.25` MuJoCo table-slip stress tests, or `1.45x` multiplier in offline mock mode) comparing **Baseline A** (single-shot `gemini-4-hydrogen`) against **Full RoboHarness**, complete with an **Honest Failure Ledger**.
   ```bash
   # Deterministic offline 12-scenario benchmark (< 1s)
-  uv run python benchmarks/eval_5sigma.py --mode offline --output PROOF_IT_WORKS.md --json-out benchmarks/eval_results.json
+  uv run python benchmarks/eval_5sigma.py --mode offline --mock-mcp --output PROOF_IT_WORKS.md --json-out benchmarks/eval_results.json
 
-  # Live 12-scenario benchmark against real Gemini 4 APIs (optional --deep for Carbon)
-  uv run python benchmarks/eval_5sigma.py --mode live --output PROOF_IT_WORKS.md --json-out benchmarks/eval_results.json
+  # Live 12-scenario benchmark against real Gemini 4 APIs + MuJoCo MCP (optional --deep for Carbon)
+  uv run python benchmarks/eval_5sigma.py --mode live --real-mcp --output PROOF_IT_WORKS.md --json-out benchmarks/eval_results.json
   ```
 - **[`GEMINI.md`](GEMINI.md)** — Clean-Room Constitution, Dual-Client (`v1` + `v1beta`) SDK invariants, Agentic Video Processing, Managed Agent configuration & Carbon escalation rules, Decisions API `0.75` thresholds, and hardware safety latches (continuously enforced by [`tests/test_sdk_invariants.py`](tests/test_sdk_invariants.py)).
 
@@ -160,6 +179,8 @@ uv run roboharness mimic --video clip.mp4 --name demo_wave --mock --offline
 
 ```text
 roboharness/
+├── LICENSE                          # MIT License
+├── .env.example                     # Documented environment variable template
 ├── GEMINI.md                        # Clean-room & Gemini 4 Dual-Client invariants
 ├── PROOF_IT_WORKS.md                # 12-scenario 5 Sigma benchmark + Failure Ledger
 ├── agent_bundle/                    # Staged into Managed Agent forked Ubuntu sandbox
