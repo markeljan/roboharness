@@ -210,44 +210,71 @@ HTML_PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>RoboHarness — 1-Click Live Demo Console</title>
+<title>RoboHarness — Live Physical Robot + 1-Click Demo Console</title>
 <style>
   :root {
     --bg: #0b0f17; --card: #121826; --border: #232d42; --text: #e6edf7; --muted: #8ea0bd;
-    --green: #22c55e; --cyan: #38bdf8; --amber: #f59e0b; --red: #ef4444; --purple: #a78bfa;
+    --green: #22c55e; --cyan: #38bdf8; --amber: #f59e0b; --red: #ef4444;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 12px 14px; background: var(--bg); color: var(--text); font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-  .brand { font-size: 16px; font-weight: 700; letter-spacing: 0.2px; display: flex; align-items: center; gap: 8px; }
-  .pills { display: flex; gap: 6px; flex-wrap: wrap; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    padding: 10px 12px; background: var(--bg); color: var(--text);
+    font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; gap: 8px; overflow: hidden;
+  }
+  .top { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
+  .brand { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
   .pill { padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); background: var(--card); color: var(--muted); }
   .pill.ok { color: var(--green); border-color: rgba(34,197,94,.45); }
   .pill.warn { color: var(--amber); border-color: rgba(245,158,11,.45); }
   .pill.cyan { color: var(--cyan); border-color: rgba(56,189,248,.45); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 8px; margin-bottom: 10px; }
-  button {
-    appearance: none; border: 1px solid var(--border); background: var(--card); color: var(--text);
-    padding: 9px 10px; border-radius: 8px; cursor: pointer; text-align: left; transition: transform .06s, border-color .15s, background .15s;
+  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; flex-shrink: 0; }
+  .mcard { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; display: flex; justify-content: space-between; align-items: baseline; }
+  .mval { font-size: 15px; font-weight: 700; color: var(--green); }
+  .mlbl { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .3px; }
+  .main { display: grid; grid-template-columns: 1.25fr 1fr; gap: 10px; flex: 1; min-height: 0; }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 8px; display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+  .cam-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
+  select {
+    background: #070a10; color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 8px; font-size: 12px; max-width: 240px;
   }
-  button:hover:not(:disabled) { border-color: var(--cyan); background: #172033; }
+  .video-wrap {
+    position: relative; flex: 1; min-height: 0; background: #000; border-radius: 8px; overflow: hidden;
+    border: 1px solid var(--border); display: flex; align-items: center; justify-content: center;
+  }
+  video#cam { width: 100%; height: 100%; object-fit: cover; background: #000; }
+  .cam-overlay {
+    position: absolute; top: 8px; left: 8px; right: 8px; display: flex; justify-content: space-between;
+    pointer-events: none;
+  }
+  .tag { background: rgba(11,15,23,.82); border: 1px solid rgba(255,255,255,.15); padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; color: #fff; }
+  .tag.live { border-color: rgba(239,68,68,.7); color: #fca5a5; }
+  .cam-hint { position: absolute; color: var(--muted); text-align: center; padding: 16px; font-size: 13px; }
+  .studio-frame { width: 100%; height: 42%; border: 1px solid var(--border); border-radius: 8px; background: #000; display: none; }
+  .studio-frame.show { display: block; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; flex-shrink: 0; }
+  button {
+    appearance: none; border: 1px solid var(--border); background: #161e2e; color: var(--text);
+    padding: 7px 9px; border-radius: 8px; cursor: pointer; text-align: left; transition: transform .06s, border-color .15s, background .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--cyan); background: #1c273d; }
   button:active:not(:disabled) { transform: scale(0.98); }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
-  button.primary { background: linear-gradient(135deg, #0ea5e9, #2563eb); border-color: #38bdf8; color: #fff; grid-column: span 2; }
+  button.primary { background: linear-gradient(135deg, #0ea5e9, #2563eb); border-color: #38bdf8; color: #fff; grid-column: span 2; padding: 9px 11px; }
   button.primary:hover:not(:disabled) { filter: brightness(1.08); }
   button.danger { border-color: rgba(239,68,68,.55); color: #fecaca; }
   button.safety { border-color: rgba(245,158,11,.55); }
-  .btitle { font-weight: 700; font-size: 13px; display: block; }
-  .bsub { font-size: 11px; color: var(--muted); display: block; margin-top: 2px; }
-  button.primary .bsub { color: rgba(255,255,255,.88); }
-  .bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11px; color: var(--muted); }
-  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
-  .mcard { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; }
-  .mval { font-size: 15px; font-weight: 700; color: var(--green); }
-  .mlbl { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+  button.mini { padding: 4px 8px; font-size: 11px; border-radius: 6px; text-align: center; }
+  .btitle { font-weight: 700; font-size: 12.5px; display: block; }
+  .bsub { font-size: 10.5px; color: var(--muted); display: block; margin-top: 1px; }
+  button.primary .bsub { color: rgba(255,255,255,.9); }
+  .bar { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--muted); flex-shrink: 0; }
   pre#log {
-    margin: 0; padding: 10px 12px; background: #070a10; border: 1px solid var(--border); border-radius: 8px;
-    height: 300px; overflow-y: auto; font: 12px/1.38 ui-monospace, SFMono-Regular, Menlo, monospace; color: #dbeafe;
+    margin: 0; padding: 8px 10px; background: #070a10; border: 1px solid var(--border); border-radius: 8px;
+    flex: 1; min-height: 0; overflow-y: auto; font: 11.5px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; color: #dbeafe;
     white-space: pre-wrap; word-break: break-word;
   }
   a { color: var(--cyan); text-decoration: none; }
@@ -255,54 +282,152 @@ HTML_PAGE = """<!doctype html>
 </head>
 <body>
   <div class="top">
-    <div class="brand">🤖 RoboHarness <span class="pill cyan">Gemini 4 + Managed Agents + Decisions-1</span></div>
+    <div class="brand">🤖 RoboHarness <span class="pill cyan">Gemini 4 + Managed Agents + Decisions-1 (0-Token Gate)</span></div>
     <div class="pills">
       <span class="pill ok">MIC: OFF</span>
       <span class="pill ok">AUDIO: MUTED</span>
-      <span class="pill cyan">Real TonyPi: :8766</span>
-      <span class="pill cyan"><a href="http://localhost:8080/" target="_blank">MuJoCo 4.0.1 Studio: :8080 ↗</a></span>
+      <span class="pill cyan">TonyPi: :8766</span>
+      <span class="pill cyan"><a href="http://localhost:8080/" target="_blank">MuJoCo 4.0.1 Studio ↗</a></span>
       <span id="runBadge" class="pill ok">IDLE — READY</span>
     </div>
   </div>
 
   <div class="metrics">
-    <div class="mcard"><div class="mval">33.3% → 91.7%</div><div class="mlbl">5 Sigma Safety Pass (+58.3 pp)</div></div>
-    <div class="mcard"><div class="mval">6 → 0 Falls</div><div class="mlbl">Real MuJoCo 3D Physics</div></div>
-    <div class="mcard"><div class="mval">2/2 (100%)</div><div class="mlbl">0.25x Low-Friction Slip Survival</div></div>
-    <div class="mcard"><div class="mval">0 Tokens</div><div class="mlbl">gemini-decision-1 Safety Gate</div></div>
+    <div class="mcard"><span class="mlbl">5 Sigma Safety</span><span class="mval">33.3% → 91.7%</span></div>
+    <div class="mcard"><span class="mlbl">MuJoCo 3D Falls</span><span class="mval">6 → 0 Falls</span></div>
+    <div class="mcard"><span class="mlbl">0.25x Slip Survival</span><span class="mval">2/2 (100%)</span></div>
+    <div class="mcard"><span class="mlbl">Decisions-1 Gate</span><span class="mval">0 Output Tokens</span></div>
   </div>
 
-  <div class="grid">
-    <button class="primary" data-act="full_demo"><span class="btitle">▶ Run Full 60s Demo Sequence</span><span class="bsub">Sim Floss (:8080) → Real Floss (1.6° tilt) → Real Wave → Backflip 0-Token Refusal → 5 Sigma</span></button>
-    <button data-act="floss_real"><span class="btitle">🕺 Floss (Real TonyPi)</span><span class="bsub">SHA-256 signed • 1.6° peak tilt</span></button>
-    <button data-act="wave_real"><span class="btitle">👋 Judge Wave (Real TonyPi)</span><span class="bsub">Spatial ER-2 check • 5.8° tilt</span></button>
-    <button data-act="orange_real"><span class="btitle">⚡ Orange Justice (Real)</span><span class="bsub">Upper-body adapted dance</span></button>
-    <button data-act="floss_sim"><span class="btitle">🖥️ Floss (MuJoCo Studio)</span><span class="bsub">Move 3D robot on :8080</span></button>
-    <button class="safety" data-act="backflip_gate"><span class="btitle">🚫 Backflip 0-Token Gate</span><span class="bsub">Live Decisions-1 safe refusal</span></button>
-    <button data-act="webcam_mimic"><span class="btitle">🎬 Live Webcam Mimic (5s)</span><span class="bsub">Record → Forge → Real TonyPi</span></button>
-    <button data-act="preflight"><span class="btitle">✅ 5/5 Preflight Check</span><span class="bsub">4 Gemini models + TonyPi MCP</span></button>
-    <button class="danger" data-act="unlatch"><span class="btitle">🔓 Unlatch STOP</span><span class="bsub">Clear tonyd latch if needed</span></button>
-    <button class="danger" data-act="get_up"><span class="btitle">⬆️ Stand Up</span><span class="bsub">Run get_up recovery</span></button>
-  </div>
+  <div class="main">
+    <div class="panel">
+      <div class="cam-bar">
+        <strong style="font-size:12px">📱 Live Robot Camera</strong>
+        <select id="camSelect"><option value="">Click "Enable iPhone Cam" →</option></select>
+        <button id="startCamBtn" class="mini" style="border-color:var(--green);color:#86efac">📷 Enable iPhone Cam</button>
+        <button id="fitBtn" class="mini">Contain / Fill</button>
+        <button id="studioBtn" class="mini" style="border-color:var(--cyan);color:var(--cyan)">🖥️ Toggle MuJoCo Sim</button>
+      </div>
+      <div class="video-wrap">
+        <video id="cam" autoplay playsinline muted></video>
+        <div class="cam-overlay">
+          <span class="tag live" id="camTag">● CAMERA OFF</span>
+          <span class="tag" id="stageTag">TONYPI PHYSICAL HARDWARE</span>
+        </div>
+        <div class="cam-hint" id="camHint">Click <b>📷 Enable iPhone Cam</b> above to auto-select your iPhone Camera.<br>(Allow browser camera permission once.)</div>
+      </div>
+      <iframe id="studioFrame" class="studio-frame" src="about:blank" title="MuJoCo 4.0.1 Studio"></iframe>
+    </div>
 
-  <div class="bar">
-    <span>Live Pipeline Stream (SSE — zero audio, zero listening)</span>
-    <span>
-      <button id="stopBtn" style="padding:3px 8px;font-size:11px;display:inline-block" class="danger">■ Stop Current</button>
-      <button id="clearBtn" style="padding:3px 8px;font-size:11px;display:inline-block">Clear Log</button>
-    </span>
+    <div class="panel">
+      <div class="grid">
+        <button class="primary" data-act="full_demo"><span class="btitle">▶ Run Full 60s Demo Sequence</span><span class="bsub">Sim Floss → Real Floss (1.6° tilt) → Real Wave → Backflip 0-Token Refusal → 5 Sigma</span></button>
+        <button data-act="floss_real"><span class="btitle">🕺 Floss (Real TonyPi)</span><span class="bsub">SHA-256 • 1.6° tilt</span></button>
+        <button data-act="wave_real"><span class="btitle">👋 Judge Wave (Real)</span><span class="bsub">ER-2 spatial • 5.8° tilt</span></button>
+        <button data-act="orange_real"><span class="btitle">⚡ Orange Justice</span><span class="bsub">Upper-body adapted</span></button>
+        <button data-act="floss_sim"><span class="btitle">🖥️ Floss (MuJoCo Sim)</span><span class="bsub">3D Studio :8080</span></button>
+        <button class="safety" data-act="backflip_gate"><span class="btitle">🚫 Backflip 0-Token Gate</span><span class="bsub">Safe Prob 0.05 → Halt</span></button>
+        <button data-act="webcam_mimic"><span class="btitle">🎬 Live Mimic (5s)</span><span class="bsub">Forge → Real TonyPi</span></button>
+        <button class="danger" data-act="unlatch"><span class="btitle">🔓 Unlatch STOP</span><span class="bsub">Clear tonyd latch</span></button>
+        <button class="danger" data-act="get_up"><span class="btitle">⬆️ Stand Up</span><span class="bsub">Run get_up recovery</span></button>
+      </div>
+
+      <div class="bar">
+        <span>Live Pipeline Telemetry (SSE — Silent Mode)</span>
+        <span>
+          <button id="stopBtn" class="mini danger">■ Stop</button>
+          <button id="clearBtn" class="mini">Clear</button>
+        </span>
+      </div>
+      <pre id="log">Ready. 1) Click "📷 Enable iPhone Cam" on the left. 2) Hit Cmd+Shift+5 to record. 3) Click "▶ Run Full 60s Demo Sequence".\n</pre>
+    </div>
   </div>
-  <pre id="log">Ready. Click "▶ Run Full 60s Demo Sequence" or any single button above.\n</pre>
 
 <script>
 const logEl = document.getElementById('log');
 const badge = document.getElementById('runBadge');
+const stageTag = document.getElementById('stageTag');
 const actBtns = [...document.querySelectorAll('button[data-act]')];
+const videoEl = document.getElementById('cam');
+const camSelect = document.getElementById('camSelect');
+const camTag = document.getElementById('camTag');
+const camHint = document.getElementById('camHint');
+const studioFrame = document.getElementById('studioFrame');
+let currentStream = null;
+let containMode = false;
+
+async function startCamera(deviceId) {
+  if (currentStream) {
+    currentStream.getTracks().forEach(t => t.stop());
+    currentStream = null;
+  }
+  const constraints = {
+    audio: false,
+    video: deviceId
+      ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      : { width: { ideal: 1920 }, height: { ideal: 1080 } }
+  };
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  currentStream = stream;
+  videoEl.srcObject = stream;
+  camHint.style.display = 'none';
+  const track = stream.getVideoTracks()[0];
+  camTag.textContent = '● LIVE: ' + (track ? track.label : 'Camera');
+  await refreshCameras(track ? track.getSettings().deviceId : deviceId);
+}
+
+async function refreshCameras(selectedId) {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter(d => d.kind === 'videoinput');
+  camSelect.innerHTML = '';
+  cams.forEach((d, idx) => {
+    const opt = document.createElement('option');
+    opt.value = d.deviceId;
+    opt.textContent = d.label || ('Camera ' + (idx + 1));
+    if (d.deviceId === selectedId) opt.selected = true;
+    camSelect.appendChild(opt);
+  });
+  return cams;
+}
+
+async function autoStartIphoneCamera() {
+  try {
+    // Request permission first so labels (including "iPhone Camera") are revealed
+    await startCamera(null);
+    const cams = await refreshCameras(null);
+    // Prefer primary iPhone Camera (avoid Desk View unless it is the only iPhone cam)
+    const iphoneMain = cams.find(c => /iphone/i.test(c.label) && !/desk/i.test(c.label));
+    const iphoneAny = iphoneMain || cams.find(c => /iphone/i.test(c.label));
+    if (iphoneAny && camSelect.value !== iphoneAny.deviceId) {
+      await startCamera(iphoneAny.deviceId);
+    }
+  } catch (err) {
+    camTag.textContent = '● CAMERA ERROR';
+    camHint.style.display = 'block';
+    camHint.textContent = 'Camera access error: ' + err.message;
+  }
+}
+
+document.getElementById('startCamBtn').addEventListener('click', autoStartIphoneCamera);
+camSelect.addEventListener('change', () => { if (camSelect.value) startCamera(camSelect.value); });
+document.getElementById('fitBtn').addEventListener('click', () => {
+  containMode = !containMode;
+  videoEl.style.objectFit = containMode ? 'contain' : 'cover';
+});
+document.getElementById('studioBtn').addEventListener('click', () => {
+  const show = !studioFrame.classList.contains('show');
+  if (show && studioFrame.src === 'about:blank') studioFrame.src = 'http://localhost:8080/';
+  studioFrame.classList.toggle('show', show);
+});
+
+// Try auto-starting camera immediately on load (works once permission is granted)
+autoStartIphoneCamera();
 
 function setRunning(running, label) {
   actBtns.forEach(b => b.disabled = running);
   badge.textContent = running ? ('RUNNING: ' + (label || '...')) : 'IDLE — READY';
   badge.className = 'pill ' + (running ? 'warn' : 'ok');
+  stageTag.textContent = running ? ('ACTIVE: ' + (label || 'RUNNING')) : 'TONYPI PHYSICAL HARDWARE';
 }
 
 function appendLine(ts, line) {
