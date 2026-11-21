@@ -273,7 +273,12 @@ def test_telemetry_sse_server_endpoints_and_streaming() -> None:
     hub_live = TelemetryHub(max_history=50)
     hub_live.emit("stage", {"stage": "FORGE", "message": "Forging 16-DOF skill"})
 
-    server = TelemetrySSEServer(hub_live, host="127.0.0.1", port=0)
+    server = TelemetrySSEServer(
+        hub_live,
+        host="127.0.0.1",
+        port=0,
+        sim_stream_url="http://127.0.0.1:8765/stream.mjpeg",
+    )
     base_url = server.start()
     try:
         health = httpx.get(f"{base_url}/health", timeout=2.0)
@@ -287,6 +292,8 @@ def test_telemetry_sse_server_endpoints_and_streaming() -> None:
         assert "gemini-decision-1" in index.text
         assert "gemini-4-carbon" in index.text
         assert "0.75 auto-branch threshold" in index.text
+        assert 'id="sim-frame"' in index.text
+        assert "http://127.0.0.1:8765/stream.mjpeg" in index.text
         assert "EventSource" in index.text
 
         received: list[dict[str, Any]] = []
@@ -301,6 +308,7 @@ def test_telemetry_sse_server_endpoints_and_streaming() -> None:
                     "effective_action": "execute_and_save",
                 },
             )
+            hub_live.emit("frame", {"b64": "/9j/4AAQ", "label": "post-run:wave"})
 
         emitter = threading.Thread(target=_emit_delayed, daemon=True)
         emitter.start()
@@ -311,13 +319,14 @@ def test_telemetry_sse_server_endpoints_and_streaming() -> None:
             for line in resp.iter_lines():
                 if line.startswith("data: "):
                     received.append(json.loads(line[6:]))
-                    if len(received) >= 2:
+                    if len(received) >= 3:
                         break
         emitter.join(timeout=1.0)
 
-        assert [r["event"] for r in received] == ["stage", "decision"]
+        assert [r["event"] for r in received] == ["stage", "decision", "frame"]
         assert received[0]["data"]["stage"] == "FORGE"
         assert received[1]["data"]["effective_action"] == "execute_and_save"
+        assert received[2]["data"]["label"] == "post-run:wave"
     finally:
         server.stop()
 

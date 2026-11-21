@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -695,3 +696,41 @@ def test_run_preflight_check_dual_clients_and_env_id_reporting(tmp_path: Path) -
     assert bad_by_comp[MOTION_MODEL].ok is False
     assert bad_by_comp["tonypi_mcp"].ok is False
     assert bad_by_comp[FORGE_AGENT_ID].ok is True
+
+
+def test_pipeline_streams_live_frame_sse_events_during_mimic_and_run(tmp_path: Path) -> None:
+    server = MockTonypiMCPServer(mode="batch")
+    clients, _v1, _beta = _make_dual_stubs()
+    settings = RoboHarnessSettings(
+        skills_dir=tmp_path / "skills",
+        forge_state_path=tmp_path / "forge_state.json",
+    )
+    video_path = tmp_path / "stream.mp4"
+    video_path.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    with _make_mcp(server) as mcp:
+        mimic_hub = TelemetryHub()
+        mimic_pipe = MimicPipeline(clients=clients, mcp=mcp, settings=settings, hub=mimic_hub)
+        mimic_res = mimic_pipe.mimic_video(video_path, "stream_wave", run_spatial=True)
+        assert mimic_res.status == "executed_and_saved"
+
+        mimic_frames = [ev for ev in mimic_hub.history() if ev["event"] == "frame"]
+        mimic_labels = [ev["data"]["label"] for ev in mimic_frames]
+        assert "pre-flight:stream_wave" in mimic_labels
+        assert "post-run:stream_wave" in mimic_labels
+        for ev in mimic_frames:
+            raw_jpg = base64.b64decode(ev["data"]["b64"])
+            assert raw_jpg.startswith(b"\xff\xd8")
+
+        run_hub = TelemetryHub()
+        run_pipe = MimicPipeline(clients=None, mcp=mcp, settings=settings, hub=run_hub, offline_mode=True)
+        run_res = run_pipe.run_saved_skill("stream_wave", run_spatial=False)
+        assert run_res.status == "executed_and_saved"
+
+        run_frames = [ev for ev in run_hub.history() if ev["event"] == "frame"]
+        run_labels = [ev["data"]["label"] for ev in run_frames]
+        assert "pre-flight:stream_wave" in run_labels
+        assert "post-run:stream_wave" in run_labels
+        for ev in run_frames:
+            raw_jpg = base64.b64decode(ev["data"]["b64"])
+            assert raw_jpg.startswith(b"\xff\xd8")

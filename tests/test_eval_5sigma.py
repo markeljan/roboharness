@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import sys
@@ -16,6 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from benchmarks.eval_5sigma import (
+    SLIP_STRESS_MUJOCO_FRICTION,
     BenchmarkReport,
     main,
     render_proof_markdown,
@@ -31,7 +33,8 @@ from roboharness.managed_forge import (
     deterministic_retarget_fallback,
 )
 from roboharness.models import DualGenAIClients
-from roboharness.schemas import DecisionGateResult
+from roboharness.schemas import DecisionGateResult, ExecutionTrace, RobotStatus, SkillArtifact
+from roboharness.telemetry_sse import TelemetryHub
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +85,92 @@ def _make_gate(
     )
 
 
+class _StubRealMujocoMCP:
+    """Offline stub emulating TonypiMCPClient connected to MujocoTonypiMCPServer."""
+
+    def __init__(self) -> None:
+        self.connected = False
+        self.closed = False
+        self.reset_calls: list[float] = []
+        self.simulate_calls: list[dict[str, Any]] = []
+        self.execute_calls: list[str] = []
+        self.last_friction: float = 1.0
+
+    def connect(self) -> list[dict[str, Any]]:
+        self.connected = True
+        return [
+            {"name": "status"},
+            {"name": "perceive"},
+            {"name": "play_frames"},
+            {"name": "simulate_motion"},
+            {"name": "reset"},
+        ]
+
+    def close(self) -> None:
+        self.closed = True
+
+    def reset_sim(self, friction: float = 1.0) -> dict[str, Any]:
+        self.last_friction = friction
+        self.reset_calls.append(friction)
+        return {"ok": True, "friction": friction}
+
+    def get_status(self) -> RobotStatus:
+        return RobotStatus(
+            battery_v=11.7,
+            max_servo_temp_c=36.0,
+            torso_pitch_deg=1.5,
+            torso_roll_deg=0.8,
+            standing=True,
+            raw={"sim": True, "contacts": 4, "friction": self.last_friction},
+        )
+
+    def perceive(self) -> tuple[bytes, str]:
+        return b"\xff\xd8\xff\xe0mujoco-perceive-frame", "image/jpeg"
+
+    def simulate_raw_frames(
+        self,
+        keyframes: list[Any],
+        *,
+        friction: float = 1.0,
+    ) -> dict[str, Any]:
+        self.simulate_calls.append({"count": len(keyframes), "friction": friction})
+        fell = friction < 0.5
+        peak_tilt = 52.4 if fell else 3.2
+        raw_jpeg = f"\xff\xd8\xff\xe0mujoco-baseline-mu-{friction}".encode()
+        return {
+            "ok": not fell,
+            "frames_executed": len(keyframes),
+            "peak_tilt_deg": peak_tilt,
+            "end_tilt_deg": peak_tilt,
+            "fell": fell,
+            "aborted": fell,
+            "contacts": 6 if fell else 4,
+            "frame_b64": base64.b64encode(raw_jpeg).decode("ascii"),
+        }
+
+    def execute_skill(self, skill: SkillArtifact, **kwargs: Any) -> ExecutionTrace:
+        self.execute_calls.append(skill.name)
+        tilt = 6.4 if self.last_friction < 0.5 else 2.9
+        post_jpeg = f"\xff\xd8\xff\xe0mujoco-robo-{skill.name}".encode()
+        return ExecutionTrace(
+            skill_name=skill.name,
+            transport_mode="batch_keyframes",
+            frames_executed=len(skill.keyframes),
+            aborted=False,
+            abort_reason=None,
+            peak_observed_tilt_deg=tilt,
+            final_status=RobotStatus(
+                battery_v=11.65,
+                max_servo_temp_c=37.5,
+                torso_pitch_deg=tilt * 0.6,
+                torso_roll_deg=tilt * 0.4,
+                standing=True,
+                raw={"sim": True, "contacts": 4, "friction": self.last_friction},
+            ),
+            post_run_frame_b64=base64.b64encode(post_jpeg).decode("ascii"),
+        )
+
+
 def test_offline_12_scenario_end_to_end_and_report_generation(tmp_path: Path) -> None:
     md_out = tmp_path / "PROOF_IT_WORKS.md"
     json_out = tmp_path / "eval_results.json"
@@ -91,6 +180,7 @@ def test_offline_12_scenario_end_to_end_and_report_generation(tmp_path: Path) ->
         [
             "--mode",
             "offline",
+            "--mock-mcp",
             "--output",
             str(md_out),
             "--json-out",
@@ -108,6 +198,7 @@ def test_offline_12_scenario_end_to_end_and_report_generation(tmp_path: Path) ->
     raw_json = json_out.read_text(encoding="utf-8")
     parsed_dict = json.loads(raw_json)
     assert parsed_dict["mode"] == "offline"
+    assert parsed_dict["physics_backend"] == "mock_mcp"
     assert parsed_dict["scenario_count"] == 12
     report = BenchmarkReport.model_validate_json(raw_json)
 
@@ -145,8 +236,10 @@ def test_offline_12_scenario_end_to_end_and_report_generation(tmp_path: Path) ->
     md_text = md_out.read_text(encoding="utf-8")
     for required_section in (
         "# PROOF IT WORKS — RoboHarness 5 Sigma Evaluation",
+        "**Physics Backend**: `mock_mcp`",
         "`>= 0.75` conf & `>= 0.75` safety",
         "## Executive Summary",
+        "| **Physics Backend** | `mock_mcp` |",
         "Physical Safety Pass Rate",
         "Zero-Clipping Rate",
         "Impossible-Move Safe Refusal Rate",
@@ -160,6 +253,7 @@ def test_offline_12_scenario_end_to_end_and_report_generation(tmp_path: Path) ->
         "### 3. Borderline Confidence Escalations (`< 0.75`)",
         "### 4. Fidelity Ceilings on Adapted & Impossible Moves",
         "## Reproducibility",
+        "--mode live --real-mcp",
         "--mode live --deep",
     ):
         assert required_section in md_text, f"Missing markdown section: {required_section}"
@@ -174,6 +268,165 @@ def test_offline_12_scenario_end_to_end_and_report_generation(tmp_path: Path) ->
         "borderline_confidence",
         "fidelity_ceiling",
     }
+
+
+def test_real_mcp_mujoco_backend_with_ui_frame_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise --real-mcp (mujoco_mcp) + TelemetryHub streaming in both offline & stubbed live."""
+    import benchmarks.eval_5sigma as eval_mod
+
+    stub_mcp = _StubRealMujocoMCP()
+    hub = TelemetryHub(max_history=100)
+
+    # 1. Offline mode against real MuJoCo MCP stub (slip_stress + nominal + impossible)
+    report = run_benchmark(
+        mode="offline",
+        scenario_ids=["dance_orange_justice", "gesture_greeting_wave", "imp_standing_backflip"],
+        real_mcp=True,
+        mcp_url="http://127.0.0.1:8765/mcp",
+        mcp_client=stub_mcp,
+        hub=hub,
+        quiet=True,
+    )
+
+    assert stub_mcp.connected is True
+    assert report.physics_backend == "mujoco_mcp"
+    assert report.mcp_url == "http://127.0.0.1:8765/mcp"
+    # reset_sim used friction=0.25 on slip_stress scenario and 1.0 on nominal scenarios
+    assert SLIP_STRESS_MUJOCO_FRICTION in stub_mcp.reset_calls
+    assert 1.0 in stub_mcp.reset_calls
+    assert len(stub_mcp.simulate_calls) == 3
+    assert stub_mcp.execute_calls == ["dance_orange_justice", "gesture_greeting_wave"]
+
+    by_id = {c.scenario_id: c for c in report.comparisons}
+    # Baseline fell in real MuJoCo low-friction trial; RoboHarness survived at 6.4 deg
+    assert by_id["dance_orange_justice"].baseline.fell is True
+    assert by_id["dance_orange_justice"].baseline.observed_peak_tilt_deg == pytest.approx(52.4)
+    assert by_id["dance_orange_justice"].baseline.contacts == 6
+    assert by_id["dance_orange_justice"].roboharness.status == "executed_safe"
+    assert by_id["dance_orange_justice"].roboharness.observed_peak_tilt_deg == pytest.approx(6.4)
+    assert by_id["imp_standing_backflip"].roboharness.status == "refused_safe"
+    assert by_id["imp_standing_backflip"].roboharness.servos_moved is False
+
+    # Verify TelemetryHub received stage, telemetry, decision, and real MuJoCo frame events
+    events = hub.history()
+    event_types = {e["event"] for e in events}
+    assert {"stage", "telemetry", "decision", "frame"}.issubset(event_types)
+    frame_labels = [e["data"]["label"] for e in events if e["event"] == "frame"]
+    assert "baseline:dance_orange_justice" in frame_labels
+    assert "roboharness:dance_orange_justice" in frame_labels
+    assert "roboharness:gesture_greeting_wave" in frame_labels
+
+    md = render_proof_markdown(report)
+    assert "**Physics Backend**: `mujoco_mcp`" in md
+    assert "| **Physics Backend** | `mujoco_mcp` |" in md
+    assert "friction=0.25" in md
+    assert "`fell`" in md
+
+    # 2. Live mode with real MuJoCo stub passes rendered 3D frames into baseline & post-run gates
+    v1_client = object()
+    beta_client = object()
+    seen_baseline_frames: list[bytes] = []
+    seen_post_run_frames: list[bytes] = []
+
+    monkeypatch.setattr(
+        eval_mod,
+        "ensure_forge_agent",
+        lambda bc, settings, *, deep=False: ForgeAgentState(
+            agent_id=settings.managed_agent_id,
+            base_environment_id="env-1",
+            model=settings.forge_model,
+            created_now=False,
+        ),
+    )
+    monkeypatch.setattr(
+        eval_mod,
+        "generate_baseline_raw_keyframes",
+        lambda c, desc: list(SCENARIOS[1].offline_baseline_raw_keyframes),
+    )
+    monkeypatch.setattr(
+        eval_mod,
+        "extract_motion_from_description",
+        lambda c, desc: SCENARIOS[1].offline_pose_sequence,
+    )
+    monkeypatch.setattr(
+        eval_mod,
+        "forge_skill_with_escalation",
+        lambda bc, settings, pose_seq, skill_name, **kw: ForgeResult(
+            artifact=deterministic_retarget_fallback(pose_seq, skill_name),
+            refused=False,
+            refusal_reason="",
+            environment_id="env-1",
+            interaction_id="int-1",
+            raw_output="{}",
+            model_used=settings.forge_model,
+            escalated_to_carbon=False,
+        ),
+    )
+
+    def _capture_baseline_gate(bc: Any, *args: Any, **kwargs: Any) -> DecisionGateResult:
+        seen_baseline_frames.extend(kwargs.get("frame_jpegs") or [])
+        return _make_gate(fidelity=0.4)
+
+    def _capture_post_gate(
+        bc: Any, skill: Any, refs: list[bytes], post_jpeg: bytes | None, *args: Any, **kwargs: Any
+    ) -> DecisionGateResult:
+        if post_jpeg:
+            seen_post_run_frames.append(post_jpeg)
+        return _make_gate(fidelity=2.7)
+
+    monkeypatch.setattr(eval_mod, "evaluate_baseline_skill", _capture_baseline_gate)
+    monkeypatch.setattr(eval_mod, "evaluate_pre_execution", lambda *a, **kw: _make_gate())
+    monkeypatch.setattr(eval_mod, "evaluate_post_run", _capture_post_gate)
+
+    live_report = run_benchmark(
+        mode="live",
+        scenario_ids=["dance_orange_justice"],
+        real_mcp=True,
+        mcp_url="http://127.0.0.1:8765/mcp",
+        mcp_client=stub_mcp,
+        hub=hub,
+        clients=DualGenAIClients(client=v1_client, beta_client=beta_client),
+        settings=RoboHarnessSettings(gemini_api_key="test-key"),
+        quiet=True,
+    )
+    assert live_report.physics_backend == "mujoco_mcp"
+    assert any(b"mujoco-baseline-mu-0.25" in f for f in seen_baseline_frames)
+    assert any(b"mujoco-robo-dance_orange_justice" in f for f in seen_post_run_frames)
+
+
+def test_cli_ui_flag_starts_and_stops_sse_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ephemeral_settings = RoboHarnessSettings(sse_host="127.0.0.1", sse_port=0)
+    monkeypatch.setattr(
+        RoboHarnessSettings,
+        "from_env",
+        classmethod(lambda cls: ephemeral_settings),
+    )
+    md_out = tmp_path / "UI_PROOF.md"
+    json_out = tmp_path / "ui_eval.json"
+    code = main(
+        [
+            "--mode",
+            "offline",
+            "--mock-mcp",
+            "--ui",
+            "--limit",
+            "1",
+            "--output",
+            str(md_out),
+            "--json-out",
+            str(json_out),
+        ]
+    )
+    assert code == 0
+    stdout = capsys.readouterr().out
+    assert "Live benchmark viewer: http://127.0.0.1:" in stdout
+    assert md_out.is_file()
 
 
 def test_scenario_selection_limit_and_subset() -> None:
@@ -196,14 +449,10 @@ def test_live_mode_fails_loudly_without_api_key_zero_mocked_fallback(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-
     empty_settings = RoboHarnessSettings(gemini_api_key=None)
     with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
         run_benchmark(mode="live", limit=1, settings=empty_settings, quiet=True)
 
-    # CLI main() exits non-zero cleanly and writes NO fake report when API key is missing
     monkeypatch.setattr(RoboHarnessSettings, "from_env", classmethod(lambda cls: empty_settings))
     md_out = tmp_path / "SHOULD_NOT_EXIST.md"
     json_out = tmp_path / "SHOULD_NOT_EXIST.json"
@@ -237,11 +486,9 @@ def test_live_mode_dual_client_routing_carbon_escalation_and_error_isolation(
 
     forge_calls: dict[str, int] = {}
     post_run_calls: list[str] = []
-    seen_deep_flags: list[bool] = []
 
     def _fake_ensure(beta_client: Any, settings: RoboHarnessSettings, *, deep: bool = False) -> Any:
         assert beta_client is v1beta_sentinel
-        seen_deep_flags.append(deep)
         return ForgeAgentState(
             agent_id=settings.forge_deep_agent_id if deep else settings.managed_agent_id,
             base_environment_id="env-fork-123",
@@ -275,7 +522,6 @@ def test_live_mode_dual_client_routing_carbon_escalation_and_error_isolation(
         **kwargs: Any,
     ) -> ForgeResult:
         assert beta_client is v1beta_sentinel
-        seen_deep_flags.append(deep)
         forge_calls[skill_name] = forge_calls.get(skill_name, 0) + 1
         if skill_name == "imp_standing_backflip":
             return ForgeResult(
@@ -314,7 +560,6 @@ def test_live_mode_dual_client_routing_carbon_escalation_and_error_isolation(
         if skill.name == "dance_floss":
             return _make_gate(route="adapt_upper_body_only", fidelity=2.5, route_conf=0.88)
         if skill.name == "asym_flamingo_balance":
-            # Borderline confidence 0.74 < 0.75 triggers safe human escalation
             return _make_gate(
                 route="execute_and_save",
                 effective_action="escalate_human",
@@ -357,11 +602,9 @@ def test_live_mode_dual_client_routing_carbon_escalation_and_error_isolation(
     assert report.scenario_count == 4
     by_id = {c.scenario_id: c for c in report.comparisons}
 
-    # Transient baseline error isolated cleanly
     assert by_id["dance_floss"].baseline.status == "error"
     assert "timeout" in (by_id["dance_floss"].baseline.error or "")
 
-    # Repair retry escalated to Carbon, adapted upper body, and executed safely
     assert by_id["dance_floss"].roboharness.forge_attempts == 2
     assert by_id["dance_floss"].roboharness.escalated_to_carbon is True
     assert by_id["dance_floss"].roboharness.model_used == "gemini-4-carbon"
@@ -370,11 +613,9 @@ def test_live_mode_dual_client_routing_carbon_escalation_and_error_isolation(
     assert by_id["dance_floss"].roboharness.post_fidelity_score == pytest.approx(2.8)
     assert report.roboharness_metrics.carbon_escalations_count == 1
 
-    # Normal gesture executed + ran post-run Decisions API on beta_client
     assert by_id["gesture_greeting_wave"].roboharness.status == "executed_safe"
     assert set(post_run_calls) == {"dance_floss", "gesture_greeting_wave"}
 
-    # Borderline confidence 0.74 (< 0.75) escalated safely without moving servos
     assert by_id["asym_flamingo_balance"].roboharness.status == "escalated_human"
     assert by_id["asym_flamingo_balance"].roboharness.servos_moved is False
     assert any(
@@ -382,7 +623,6 @@ def test_live_mode_dual_client_routing_carbon_escalation_and_error_isolation(
         for e in report.failure_ledger
     )
 
-    # Impossible backflip safely refused without moving servos
     assert by_id["imp_standing_backflip"].roboharness.status == "refused_safe"
     assert by_id["imp_standing_backflip"].roboharness.servos_moved is False
 

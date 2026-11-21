@@ -673,5 +673,66 @@ def debug_video(
     console.print(json.dumps(diagnosis, indent=2, sort_keys=True))
 
 
+@app.command(name="sim-server")
+def sim_server(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Bind host for the MuJoCo MCP HTTP server."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", min=1, max=65535, help="Bind port for the MuJoCo MCP HTTP server."),
+    ] = 8765,
+    viewer: Annotated[
+        bool,
+        typer.Option(
+            "--viewer/--no-viewer",
+            help="Launch interactive 3D MuJoCo passive viewer (use `mjpython` on macOS).",
+        ),
+    ] = False,
+    friction: Annotated[
+        float,
+        typer.Option(
+            "--friction",
+            min=0.05,
+            help="Floor sliding friction scale (1.0=normal, 0.25=low-friction slip).",
+        ),
+    ] = 1.0,
+    xml: Annotated[
+        Path | None,
+        typer.Option("--xml", help="Optional path to TonyPi MuJoCo scene.xml asset."),
+    ] = None,
+) -> None:
+    """Launch the clean-room MuJoCo Streamable HTTP MCP server + live MJPEG stream."""
+    console = _console()
+    try:
+        from roboharness.mujoco_mcp_server import run_server
+    except ImportError as exc:
+        console.print(
+            "[bold red]Error:[/bold red] MuJoCo simulator dependency is not installed. "
+            "Run `uv sync --extra sim` first."
+        )
+        raise typer.Exit(code=1) from exc
+
+    info_lines = [
+        f"[bold]MCP Endpoint:[/bold] http://{host}:{port}/mcp",
+        f"[bold]Live MJPEG Stream:[/bold] http://{host}:{port}/stream.mjpeg",
+        f"[bold]Latest Snapshot:[/bold] http://{host}:{port}/frame.jpg",
+        f"[bold]Floor Friction Scale:[/bold] {friction:.2f}x",
+        (
+            "[dim]macOS 3D interactive viewer tip: "
+            f"uv run mjpython -m roboharness.mujoco_mcp_server --port {port} --viewer[/dim]"
+        ),
+    ]
+    console.print(
+        Panel("\n".join(info_lines), title="RoboHarness MuJoCo MCP Server", border_style="cyan")
+    )
+    try:
+        run_server(host=host, port=port, viewer=viewer, friction=friction, xml_path=xml)
+    except (FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
+        console.print(f"[bold red]MuJoCo server error:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
 if __name__ == "__main__":
     app()

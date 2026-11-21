@@ -21,6 +21,7 @@ import base64
 import json
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -327,6 +328,57 @@ class MimicPipeline:
         if self.hub is not None:
             self.hub.emit(event_type, data)
 
+    def _emit_frame(self, frame_jpeg: bytes | None, label: str) -> None:
+        """Stream a JPEG camera/MuJoCo frame to the SSE telemetry viewport."""
+        if self.hub is not None and frame_jpeg:
+            self.hub.emit(
+                "frame",
+                {
+                    "b64": base64.b64encode(frame_jpeg).decode("ascii"),
+                    "label": label,
+                },
+            )
+
+    def _emit_frame_b64(self, frame_b64: str | None, label: str) -> None:
+        """Stream an already base64-encoded JPEG frame to the SSE telemetry viewport."""
+        if self.hub is not None and frame_b64:
+            self.hub.emit("frame", {"b64": frame_b64, "label": label})
+
+    def _capture_preflight_frame(self, skill_name: str) -> bytes | None:
+        """Best-effort camera snapshot to seed the live SSE viewport before execution."""
+        if self.hub is None:
+            return None
+        try:
+            frame_jpeg, _ = self.mcp.perceive()
+        except (MCPClientError, OSError, ValueError) as exc:
+            logger.debug("Best-effort preflight perceive skipped: %s", exc)
+            return None
+        self._emit_frame(frame_jpeg, f"pre-flight:{skill_name}")
+        return frame_jpeg
+
+    def _make_on_frame_callback(
+        self, skill_name: str
+    ) -> Callable[[int, int, ServoKeyframe, RobotStatus], None]:
+        def _on_frame(idx: int, total: int, _frame: ServoKeyframe, f_status: RobotStatus) -> None:
+            f_verdict = check_robot_telemetry(f_status)
+            self._emit(
+                "telemetry",
+                {
+                    "stage": "execute",
+                    "battery_v": f_status.battery_v,
+                    "max_servo_temp_c": f_status.max_servo_temp_c,
+                    "tilt_deg": f_verdict.tilt_deg if f_verdict.tilt_deg is not None else 0.0,
+                    "frame_index": idx,
+                    "total_frames": total,
+                    "message": f"Frame {idx + 1}/{total}",
+                },
+            )
+            raw_b64 = f_status.raw.get("frame_b64") if isinstance(f_status.raw, dict) else None
+            if isinstance(raw_b64, str) and raw_b64:
+                self._emit_frame_b64(raw_b64, f"frame:{skill_name}:{idx + 1}/{total}")
+
+        return _on_frame
+
     def _require_live_clients(self) -> tuple[Any, Any]:
         if self.v1_client is None or self.beta_client is None:
             raise RuntimeError(_LIVE_CLIENTS_ERROR)
@@ -367,9 +419,10 @@ class MimicPipeline:
         self,
         *,
         run_spatial: bool,
+        skill_name: str = "",
     ) -> tuple[SpatialFramingResult | None, bytes | None]:
         if not run_spatial or self.offline_mode:
-            return None, None
+            return None, self._capture_preflight_frame(skill_name)
 
         _, beta_client = self._require_live_clients()
         self._emit(
@@ -394,6 +447,9 @@ class MimicPipeline:
                 },
             )
             return None, None
+
+        label = f"pre-flight:{skill_name}" if skill_name else "pre-flight"
+        self._emit_frame(frame_jpeg, label)
 
         spatial_res = check_workspace_framing(beta_client, frame_jpeg)
         self._emit(
@@ -654,7 +710,9 @@ class MimicPipeline:
             )
 
         # 2. Optional live spatial workspace framing check (v1beta preview model)
-        spatial_res, robot_frame_jpeg = self._run_spatial_check(run_spatial=run_spatial)
+        spatial_res, robot_frame_jpeg = self._run_spatial_check(
+            run_spatial=run_spatial, skill_name=skill_name
+        )
         adaptation_hint: str | None = None
         if spatial_res is not None:
             if not spatial_res.workspace_clear:
@@ -1018,26 +1076,13 @@ class MimicPipeline:
         self._safe_say(announcement)
         self._emit("stage", {"stage": "execute", "message": announcement})
 
-        def _on_frame(idx: int, total: int, _frame: ServoKeyframe, f_status: RobotStatus) -> None:
-            f_verdict = check_robot_telemetry(f_status)
-            self._emit(
-                "telemetry",
-                {
-                    "battery_v": f_status.battery_v,
-                    "max_servo_temp_c": f_status.max_servo_temp_c,
-                    "tilt_deg": f_verdict.tilt_deg if f_verdict.tilt_deg is not None else 0.0,
-                    "frame_index": idx,
-                    "total_frames": total,
-                    "message": f"Frame {idx + 1}/{total}",
-                },
-            )
-
         execution = self.mcp.execute_skill(
             artifact,
             dry_run=False,
             speed_scale=speed_scale,
-            on_frame=_on_frame,
+            on_frame=self._make_on_frame_callback(skill_name),
         )
+        self._emit_frame_b64(execution.post_run_frame_b64, f"post-run:{skill_name}")
         self._emit(
             "execute",
             {
@@ -1162,7 +1207,9 @@ class MimicPipeline:
                 artifact=artifact,
             )
 
-        spatial_res, robot_frame_jpeg = self._run_spatial_check(run_spatial=run_spatial)
+        spatial_res, robot_frame_jpeg = self._run_spatial_check(
+            run_spatial=run_spatial, skill_name=artifact.name
+        )
         if spatial_res is not None:
             if not spatial_res.workspace_clear:
                 reason = f"Workspace not clear: {spatial_res.summary}"
@@ -1220,7 +1267,13 @@ class MimicPipeline:
         )
         self._safe_say(announcement)
         self._emit("stage", {"stage": "execute", "message": announcement})
-        execution = self.mcp.execute_skill(artifact, dry_run=False, speed_scale=speed_scale)
+        execution = self.mcp.execute_skill(
+            artifact,
+            dry_run=False,
+            speed_scale=speed_scale,
+            on_frame=self._make_on_frame_callback(artifact.name),
+        )
+        self._emit_frame_b64(execution.post_run_frame_b64, f"post-run:{artifact.name}")
         self._emit(
             "execute",
             {

@@ -60,7 +60,7 @@ def _settings_with_ephemeral_sse(
 def test_cli_help_lists_all_commands_and_options() -> None:
     res = runner.invoke(app, ["--help"])
     assert res.exit_code == 0
-    for cmd in ("mimic", "run", "list", "check", "forge-setup", "debug-video"):
+    for cmd in ("mimic", "run", "list", "check", "forge-setup", "debug-video", "sim-server"):
         assert cmd in res.output
 
     mimic_help = runner.invoke(app, ["mimic", "--help"])
@@ -75,6 +75,11 @@ def test_cli_help_lists_all_commands_and_options() -> None:
     assert dbg_help.exit_code == 0
     for flag in ("--video", "--name", "--expected"):
         assert flag in dbg_help.output
+
+    sim_help = runner.invoke(app, ["sim-server", "--help"])
+    assert sim_help.exit_code == 0
+    for flag in ("--host", "--port", "--viewer", "--friction"):
+        assert flag in sim_help.output
 
 
 def test_cli_list_empty_then_populated_via_mimic_and_run(

@@ -18,7 +18,11 @@ from typing import Any, Literal, Self
 
 import httpx
 
-from roboharness.config import MIN_KEYFRAME_DURATION_MS, RoboHarnessSettings
+from roboharness.config import (
+    MAX_TORSO_TILT_DEG,
+    MIN_KEYFRAME_DURATION_MS,
+    RoboHarnessSettings,
+)
 from roboharness.safety import check_robot_telemetry, check_skill_keyframes
 from roboharness.schemas import (
     JOINTS_BY_ID,
@@ -58,6 +62,7 @@ _SAY_TOOL_CANDIDATES: tuple[str, ...] = (
     "announce",
 )
 _BATCH_TOOL_CANDIDATES: tuple[str, ...] = (
+    "play_frames",
     "run_keyframes",
     "play_keyframes",
     "execute_keyframes",
@@ -84,6 +89,16 @@ _RUN_ACTION_CANDIDATES: tuple[str, ...] = (
     "play_action",
     "execute_action",
     "run_action_group",
+)
+_RESET_TOOL_CANDIDATES: tuple[str, ...] = (
+    "reset",
+    "reset_sim",
+    "sim_reset",
+)
+_SIMULATE_TOOL_CANDIDATES: tuple[str, ...] = (
+    "simulate_motion",
+    "simulate_frames",
+    "sim_motion",
 )
 
 _SERVO_ID_RE = re.compile(r"^(?:servo[_-]?|id[_-]?)?(\d+)$", re.IGNORECASE)
@@ -657,6 +672,78 @@ class TonypiMCPClient:
         self.call_tool(str(tool["name"]), {arg_key: text})
         return True
 
+    def reset_sim(self, friction: float = 1.0) -> dict[str, Any] | None:
+        """Reset simulator state with optional floor friction scale if `reset` is advertised."""
+        tool = self._find_tool(_RESET_TOOL_CANDIDATES)
+        if tool is None:
+            return None
+        schema = tool.get("inputSchema")
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        args: dict[str, Any] = {}
+        if not props or "friction" in props:
+            args["friction"] = float(friction)
+        result = self.call_tool(str(tool["name"]), args)
+        return _extract_tool_payload(result)
+
+    def simulate_raw_frames(
+        self,
+        keyframes: Sequence[ServoKeyframe],
+        *,
+        friction: float = 1.0,
+        settle_s: float = 0.8,
+        render: bool = True,
+    ) -> dict[str, Any] | None:
+        """Simulate unguarded raw keyframes via `simulate_motion` if advertised by simulator MCP."""
+        tool = self._find_tool(_SIMULATE_TOOL_CANDIDATES)
+        if tool is None:
+            return None
+        schema = tool.get("inputSchema")
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        use_ids = _schema_prefers_servo_ids(tool)
+
+        frames_key = "frames"
+        for cand in ("frames", "keyframes", "sequence"):
+            if cand in props:
+                frames_key = cand
+                break
+
+        item_props: dict[str, Any] = {}
+        frames_prop = props.get(frames_key)
+        if isinstance(frames_prop, dict) and isinstance(frames_prop.get("items"), dict):
+            item_props = frames_prop["items"].get("properties", {}) or {}
+
+        servo_field = "pos"
+        for cand in ("pos", "servos", "positions", "joints"):
+            if cand in item_props:
+                servo_field = cand
+                break
+
+        dur_field = "ms"
+        if "duration_ms" in item_props and "ms" not in item_props:
+            dur_field = "duration_ms"
+
+        formatted_frames = [
+            {
+                dur_field: int(kf.duration_ms),
+                servo_field: _format_servos_for_schema(kf.servos, use_servo_ids=use_ids),
+            }
+            for kf in keyframes
+        ]
+        args: dict[str, Any] = {frames_key: formatted_frames}
+        if "start" in props:
+            args["start"] = "home"
+        if "settle_s" in props:
+            args["settle_s"] = float(settle_s)
+        if "render" in props:
+            args["render"] = bool(render)
+        if "friction" in props:
+            args["friction"] = float(friction)
+        else:
+            self.reset_sim(friction=friction)
+
+        result = self.call_tool(str(tool["name"]), args)
+        return _extract_tool_payload(result)
+
     def _select_execution_tools(
         self,
     ) -> tuple[
@@ -684,10 +771,12 @@ class TonypiMCPClient:
     ) -> dict[str, Any]:
         schema = tool_def.get("inputSchema")
         props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        tool_name_l = str(tool_def.get("name", "")).lower()
+        is_play_frames = tool_name_l == "play_frames" or tool_name_l.endswith("_play_frames")
         use_ids = _schema_prefers_servo_ids(tool_def)
 
-        frames_key = "keyframes"
-        for cand in ("keyframes", "frames", "sequence", "steps"):
+        frames_key = "frames" if is_play_frames else "keyframes"
+        for cand in ("frames", "keyframes", "sequence", "steps"):
             if cand in props:
                 frames_key = cand
                 break
@@ -697,8 +786,8 @@ class TonypiMCPClient:
         if isinstance(frames_prop, dict) and isinstance(frames_prop.get("items"), dict):
             item_props = frames_prop["items"].get("properties", {}) or {}
 
-        servo_field = "servos"
-        for cand in ("servos", "positions", "joints", "servo_positions"):
+        servo_field = "pos" if is_play_frames else "servos"
+        for cand in ("pos", "servos", "positions", "joints", "servo_positions"):
             if cand in item_props:
                 servo_field = cand
                 break
@@ -715,15 +804,23 @@ class TonypiMCPClient:
                     kf.servos, use_servo_ids=use_ids, as_list=servo_as_list
                 ),
             }
-            if "duration" in item_props and "duration_ms" not in item_props:
+            if "ms" in item_props or (is_play_frames and "duration_ms" not in item_props):
+                entry["ms"] = scaled_ms
+            elif "duration" in item_props and "duration_ms" not in item_props:
                 entry["duration"] = round(scaled_ms / 1000.0, 4)
             else:
                 entry["duration_ms"] = scaled_ms
-            if kf.note:
+            if kf.note and not is_play_frames:
                 entry["note"] = kf.note
             formatted_frames.append(entry)
 
         args: dict[str, Any] = {frames_key: formatted_frames}
+        if "hold_s" in props or is_play_frames:
+            args["hold_s"] = 0.5
+        if "guard_tilt_deg" in props or is_play_frames:
+            args["guard_tilt_deg"] = MAX_TORSO_TILT_DEG
+        if "wait" in props or is_play_frames:
+            args["wait"] = True
         if "speed_scale" in props:
             args["speed_scale"] = speed_scale
         elif "speed" in props:
@@ -742,10 +839,12 @@ class TonypiMCPClient:
     ) -> dict[str, Any]:
         schema = tool_def.get("inputSchema")
         props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        tool_name_l = str(tool_def.get("name", "")).lower()
+        is_set_pose = tool_name_l == "set_pose" or tool_name_l.endswith("_set_pose")
         use_ids = _schema_prefers_servo_ids(tool_def)
 
-        servo_key = "servos"
-        for cand in ("servos", "positions", "joints", "targets", "servo_positions"):
+        servo_key = "positions" if is_set_pose else "servos"
+        for cand in ("positions", "pos", "servos", "joints", "targets", "servo_positions"):
             if cand in props:
                 servo_key = cand
                 break
@@ -757,12 +856,16 @@ class TonypiMCPClient:
             )
         }
         scaled_ms = max(1, round(frame.duration_ms / speed_scale))
-        if "duration_ms" in props:
+        if "ms" in props or (is_set_pose and "duration_ms" not in props):
+            args["ms"] = scaled_ms
+        elif "duration_ms" in props:
             args["duration_ms"] = scaled_ms
         elif "time_ms" in props:
             args["time_ms"] = scaled_ms
         elif "duration" in props:
             args["duration"] = round(scaled_ms / 1000.0, 4)
+        if "hold_s" in props or is_set_pose:
+            args["hold_s"] = 0.2
         return args
 
     def execute_skill(
@@ -840,22 +943,32 @@ class TonypiMCPClient:
         final_status = pre_status
         total_frames = len(skill.keyframes)
 
+        payload_frame_b64: str | None = None
         if planned_mode == "batch_keyframes":
             args = self._build_batch_args(primary_tool, skill, speed_scale)
             raw_res = self.call_tool(str(primary_tool["name"]), args)
             payload = _extract_tool_payload(raw_res)
             frames_executed = int(payload.get("frames_executed", total_frames))
-            payload_peak = _first_float(payload, ("peak_tilt_deg", "peak_observed_tilt_deg"), 0.0)
+            payload_peak = _first_float(
+                payload, ("peak_tilt_deg", "max_tilt_deg", "peak_observed_tilt_deg"), 0.0
+            )
             peak_tilt = max(peak_tilt, float(payload_peak or 0.0))
+            if isinstance(payload.get("frame_b64"), str) and payload["frame_b64"]:
+                payload_frame_b64 = payload["frame_b64"]
 
             final_status = self.get_status()
             final_tilt = math.hypot(final_status.torso_pitch_deg, final_status.torso_roll_deg)
             peak_tilt = max(peak_tilt, final_tilt)
 
-            if payload.get("aborted"):
+            if payload.get("aborted") or payload.get("fell"):
                 aborted = True
                 abort_reason = str(
-                    payload.get("abort_reason") or "Hardware batch execution aborted"
+                    payload.get("abort_reason")
+                    or (
+                        "Robot fell during batch execution"
+                        if payload.get("fell")
+                        else "Hardware batch execution aborted"
+                    )
                 )
             else:
                 post_verdict = check_robot_telemetry(final_status)
@@ -944,7 +1057,7 @@ class TonypiMCPClient:
                 last_idx = min(frames_executed, total_frames) - 1
                 on_frame(last_idx, total_frames, skill.keyframes[last_idx], final_status)
 
-        post_run_frame_b64 = self._try_perceive_b64()
+        post_run_frame_b64 = self._try_perceive_b64() or payload_frame_b64
         return ExecutionTrace(
             skill_name=skill.name,
             transport_mode=planned_mode,

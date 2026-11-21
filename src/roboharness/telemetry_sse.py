@@ -6,6 +6,7 @@ dark-theme horizontal status strip strictly subordinate to the physical TonyPi r
 
 from __future__ import annotations
 
+import html
 import json
 import queue
 import threading
@@ -140,8 +141,13 @@ def format_sse_frame(envelope: dict[str, Any]) -> bytes:
     return frame.encode("utf-8")
 
 
-def _render_strip_html() -> str:
-    """Render the self-contained dark-theme horizontal telemetry strip HTML."""
+def _render_strip_html(*, sim_stream_url: str | None = None) -> str:
+    """Render the self-contained dark-theme horizontal telemetry strip + live viewport HTML."""
+    stream_src_attr = (
+        f' src="{html.escape(sim_stream_url, quote=True)}"' if sim_stream_url else ""
+    )
+    initial_cam_label = "MUJOCO STREAM" if sim_stream_url else "CAM IDLE"
+    initial_img_class = "sim-img active" if sim_stream_url else "sim-img"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -178,6 +184,48 @@ def _render_strip_html() -> str:
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 8px 12px;
+  }}
+  .viewport {{
+    position: relative;
+    width: 160px;
+    height: 120px;
+    flex: 0 0 auto;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #060910;
+    border: 1px solid #334155;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }}
+  .sim-img {{
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: none;
+  }}
+  .sim-img.active {{ display: block; }}
+  .vp-placeholder {{
+    color: var(--muted);
+    font-size: 10px;
+    text-align: center;
+    padding: 6px;
+  }}
+  .vp-label {{
+    position: absolute;
+    left: 4px;
+    bottom: 4px;
+    max-width: 152px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    background: rgba(9, 13, 20, 0.82);
+    color: var(--cyan);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 9px;
+    letter-spacing: 0.04em;
   }}
   .brand {{
     display: flex;
@@ -279,6 +327,12 @@ def _render_strip_html() -> str:
 </head>
 <body>
   <div class="strip" role="status" aria-live="polite">
+    <div class="viewport" title="Live MuJoCo / TonyPi camera viewport">
+      <img id="sim-frame" class="{initial_img_class}" alt="Live robot camera frame"{stream_src_attr} />
+      <span id="vp-placeholder" class="vp-placeholder"{" style=\"display:none\"" if sim_stream_url else ""}>Awaiting camera frame</span>
+      <span id="frame-label" class="vp-label">{initial_cam_label}</span>
+    </div>
+
     <div class="brand">
       <span id="conn-dot" class="dot" title="SSE connection"></span>
       <span class="title">ROBOHARNESS</span>
@@ -324,6 +378,9 @@ def _render_strip_html() -> str:
 <script>
 (function() {{
   const dot = document.getElementById("conn-dot");
+  const simFrame = document.getElementById("sim-frame");
+  const vpPlaceholder = document.getElementById("vp-placeholder");
+  const frameLabel = document.getElementById("frame-label");
   const stageBadge = document.getElementById("stage-badge");
   const gBat = document.getElementById("g-bat");
   const gTmp = document.getElementById("g-tmp");
@@ -357,6 +414,13 @@ def _render_strip_html() -> str:
     const ev = env.event || "message";
     const d = env.data || {{}};
 
+    const b64 = d.b64 || d.frame_b64 || d.jpeg_b64 || d.image_b64;
+    if (typeof b64 === "string" && b64.length > 0) {{
+      simFrame.src = b64.startsWith("data:") ? b64 : ("data:image/jpeg;base64," + b64);
+      simFrame.className = "sim-img active";
+      if (vpPlaceholder) vpPlaceholder.style.display = "none";
+      if (frameLabel) frameLabel.textContent = String(d.label || ev).slice(0, 28);
+    }}
     if (d.stage) {{
       stageBadge.textContent = String(d.stage).toUpperCase();
       stageBadge.className = "stage" + (String(d.stage).toLowerCase().includes("abort") ? " aborted" : "");
@@ -391,6 +455,15 @@ def _render_strip_html() -> str:
       decAct.textContent = String(d.effective_action || d.route);
     }}
 
+    if (ev === "frame" && !d.message) {{
+      logEl.textContent = "";
+      const tag = document.createElement("strong");
+      tag.textContent = "[frame] ";
+      logEl.appendChild(tag);
+      logEl.appendChild(document.createTextNode(String(d.label || "Camera frame updated")));
+      return;
+    }}
+
     const summary = d.message || d.summary || d.abort_reason || JSON.stringify(d);
     logEl.textContent = "";
     const tag = document.createElement("strong");
@@ -404,8 +477,9 @@ def _render_strip_html() -> str:
   es.onerror = () => {{ dot.className = "dot err"; }};
 
   const eventNames = [
-    "message", "stage", "model", "telemetry", "decision",
-    "spatial", "execution", "safety", "log", "status", "error"
+    "message", "stage", "model", "telemetry", "decision", "frame",
+    "spatial", "extract", "forge", "execute", "execution", "safety",
+    "done", "log", "status", "error"
   ];
   eventNames.forEach((name) => {{
     es.addEventListener(name, (evt) => {{
@@ -429,14 +503,17 @@ class TelemetrySSEServer:
         hub: TelemetryHub,
         host: str = "127.0.0.1",
         port: int = 8770,
+        *,
+        sim_stream_url: str | None = None,
     ) -> None:
         self.hub = hub
         self.host = host
         self.port = port
+        self.sim_stream_url = sim_stream_url
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._url: str | None = None
-        self._html_bytes: bytes = _render_strip_html().encode("utf-8")
+        self._html_bytes: bytes = _render_strip_html(sim_stream_url=sim_stream_url).encode("utf-8")
 
     def __enter__(self) -> Self:
         self.start()
