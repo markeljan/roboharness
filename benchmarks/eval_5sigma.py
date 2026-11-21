@@ -1749,19 +1749,19 @@ def _build_failure_ledger(
             )
         )
 
-    impossible_scenarios = [c for c in comparisons if c.expect_refusal]
-    if impossible_scenarios:
-        imp_ids = ", ".join(c.scenario_id for c in impossible_scenarios)
+    refused_scenarios = [c for c in comparisons if c.roboharness.status == "refused_safe"]
+    if refused_scenarios:
+        refused_ids = ", ".join(c.scenario_id for c in refused_scenarios)
         ledger.append(
             FailureLedgerEntry(
                 category="fidelity_ceiling",
-                scenario_id=imp_ids,
+                scenario_id=refused_ids,
                 system="roboharness",
                 summary="Unadaptable acrobatics refused (0.00 executable fidelity by design)",
                 detail=(
-                    f"Impossible scenarios ({imp_ids}) exceed 16-DOF tabletop bus-servo physics "
-                    "(airborne flip, floor splits, vertical jump dunk). RoboHarness refuses "
-                    "actuation rather than hallucinating an unsafe or unrecognizable approximation."
+                    f"Refused scenarios ({refused_ids}) exceed 16-DOF tabletop bus-servo physics. "
+                    "RoboHarness refused actuation rather than hallucinating an unsafe or "
+                    "unrecognizable approximation."
                 ),
             )
         )
