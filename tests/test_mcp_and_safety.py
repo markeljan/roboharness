@@ -462,3 +462,114 @@ def test_capture_synthetic_video_and_extract_preview_frames(tmp_path: Path) -> N
         pytest.raises(CaptureError),
     ):
         extract_preview_frames(corrupt, count=1)
+
+
+def test_real_tonypi_mcp_nested_state_status_and_play_frames_servo_ids() -> None:
+    """Regression test for real physical tonypi-mcp nested `state` dict and string servo IDs."""
+    play_calls: list[dict[str, Any]] = []
+    robot_state: dict[str, Any] = {
+        "busy": False,
+        "tilt_deg": 82.2,
+        "lying": True,
+        "asleep": False,
+        "battery_mv": 11048,
+        "temps": {"1": 27, "6": 29, "8": 32},
+        "hottest": [8, "left shoulder", 32],
+        "stop_latched": False,
+    }
+
+    def _tonypi_handler(request: httpx.Request) -> httpx.Response:
+        msg = json.loads(request.content.decode("utf-8"))
+        method = msg["method"]
+        req_id = msg.get("id")
+        if method == "notifications/initialized":
+            return httpx.Response(202, headers={"Mcp-Session-Id": "tonypi-live"})
+        if method == "initialize":
+            res: dict[str, Any] = {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "tonypi-mcp", "version": "1.0.0"},
+            }
+        elif method == "tools/list":
+            res = {
+                "tools": [
+                    {"name": "status", "inputSchema": {"type": "object", "properties": {}}},
+                    {
+                        "name": "play_frames",
+                        "description": 'Execute frames [{"ms": 400, "pos": {"4": 500}}]',
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "frames": {"type": "array"},
+                                "hold_s": {"type": "number"},
+                                "guard_tilt_deg": {"type": "number"},
+                                "wait": {"type": "boolean"},
+                            },
+                            "required": ["frames"],
+                        },
+                    },
+                ]
+            }
+        elif method == "tools/call" and msg["params"]["name"] == "status":
+            payload = {
+                "profile": "learning",
+                "state": dict(robot_state),
+                "last_job": None,
+                "skills": {},
+            }
+            res = {"content": [{"type": "text", "text": json.dumps(payload)}]}
+        else:
+            args = msg["params"]["arguments"]
+            play_calls.append(args)
+            res = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "ok": True,
+                                "frames_executed": len(args.get("frames", [])),
+                                "peak_tilt_deg": 4.5,
+                            }
+                        ),
+                    }
+                ]
+            }
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json", "Mcp-Session-Id": "tonypi-live"},
+            json={"jsonrpc": "2.0", "id": req_id, "result": res},
+        )
+
+    skill = _make_safe_skill("live_wave")
+    with TonypiMCPClient(
+        "http://127.0.0.1:8766/mcp", transport=httpx.MockTransport(_tonypi_handler)
+    ) as client:
+        # 1. While lying with tilt_deg=82.2 -> normalized accurately & hard latch blocks actuation!
+        st = client.get_status()
+        assert st.battery_v == pytest.approx(11.048, abs=0.001)
+        assert st.max_servo_temp_c == pytest.approx(32.0, abs=0.01)
+        assert st.standing is False
+        assert st.torso_pitch_deg == pytest.approx(82.2, abs=0.01)
+        assert st.torso_roll_deg == pytest.approx(0.0, abs=0.01)
+
+        blocked = client.execute_skill(skill)
+        assert blocked.aborted is True
+        assert blocked.frames_executed == 0
+        assert blocked.abort_reason is not None and "82.2" in blocked.abort_reason
+        assert play_calls == []
+
+        # 2. Once upright -> play_frames emits string servo IDs "1".."16" in `pos`
+        robot_state["lying"] = False
+        robot_state["tilt_deg"] = 2.1
+        ok_trace = client.execute_skill(skill)
+        assert ok_trace.aborted is False
+        assert ok_trace.transport_mode == "batch_keyframes"
+        assert ok_trace.peak_observed_tilt_deg == pytest.approx(4.5, abs=0.01)
+        assert len(play_calls) == 1
+        sent_pos = play_calls[0]["frames"][0]["pos"]
+        assert all(k.isdigit() for k in sent_pos)
+        assert sent_pos["6"] == 640  # r_shoulder_pitch == servo_id 6
+        assert play_calls[0]["guard_tilt_deg"] == pytest.approx(30.0, abs=0.01)
+        assert play_calls[0]["hold_s"] == pytest.approx(0.5, abs=0.01)
+        assert play_calls[0]["wait"] is True

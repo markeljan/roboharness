@@ -7,6 +7,7 @@ import importlib.util
 import io
 import math
 import socket
+import time
 from collections.abc import Iterator
 
 import httpx
@@ -221,7 +222,15 @@ def test_mujoco_4_studio_web_viewer_sync_and_plugin(
     mcp_url = mujoco_server.start_http(host="127.0.0.1", port=0)
     try:
         assert studio_url == f"http://localhost:{free_port}/"
-        web_resp = httpx.get(f"http://127.0.0.1:{free_port}/", timeout=3.0)
+        web_resp: httpx.Response | None = None
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                web_resp = httpx.get(f"http://127.0.0.1:{free_port}/", timeout=1.0)
+                break
+            except httpx.ConnectError:
+                time.sleep(0.03)
+        assert web_resp is not None
         assert web_resp.status_code == 200
         assert len(web_resp.content) > 1000
 

@@ -102,6 +102,7 @@ _SIMULATE_TOOL_CANDIDATES: tuple[str, ...] = (
 )
 
 _SERVO_ID_RE = re.compile(r"^(?:servo[_-]?|id[_-]?)?(\d+)$", re.IGNORECASE)
+_POS_NUMERIC_KEY_RE = re.compile(r"""["']pos(?:itions)?["']\s*:\s*\{\s*["']\d+["']""")
 
 
 class MCPClientError(RuntimeError):
@@ -250,17 +251,21 @@ def _first_float(mapping: dict[str, Any], keys: Sequence[str], default: float | 
 
 
 def _normalize_robot_status(payload: dict[str, Any]) -> RobotStatus:
-    """Normalize heterogeneous MCP status responses into canonical `RobotStatus`."""
-    imu = payload.get("imu") if isinstance(payload.get("imu"), dict) else {}
-    orientation = payload.get("orientation") if isinstance(payload.get("orientation"), dict) else {}
-    battery_obj = payload.get("battery") if isinstance(payload.get("battery"), dict) else {}
-    power_obj = payload.get("power") if isinstance(payload.get("power"), dict) else {}
+    """Normalize heterogeneous MCP status responses (flat or nested `state`) into `RobotStatus`."""
+    nested_state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+    # Nested `state` (real tonypi-mcp) takes precedence for telemetry fields while preserving top-level fallbacks.
+    merged: dict[str, Any] = {**payload, **nested_state}
+
+    imu = merged.get("imu") if isinstance(merged.get("imu"), dict) else {}
+    orientation = merged.get("orientation") if isinstance(merged.get("orientation"), dict) else {}
+    battery_obj = merged.get("battery") if isinstance(merged.get("battery"), dict) else {}
+    power_obj = merged.get("power") if isinstance(merged.get("power"), dict) else {}
 
     battery_v = _first_float(
-        payload, ("battery_v", "battery_voltage", "voltage_v", "voltage", "battery")
+        merged, ("battery_v", "battery_voltage", "voltage_v", "voltage", "battery")
     )
-    if battery_v is None and "battery_mv" in payload:
-        mv = _first_float(payload, ("battery_mv",))
+    if battery_v is None and "battery_mv" in merged:
+        mv = _first_float(merged, ("battery_mv",))
         if mv is not None:
             battery_v = mv / 1000.0
     if battery_v is None:
@@ -279,7 +284,7 @@ def _normalize_robot_status(payload: dict[str, Any]) -> RobotStatus:
         battery_v = battery_v / 1000.0
 
     max_temp = _first_float(
-        payload,
+        merged,
         (
             "max_servo_temp_c",
             "servo_temp_c",
@@ -290,50 +295,80 @@ def _normalize_robot_status(payload: dict[str, Any]) -> RobotStatus:
         ),
     )
     if max_temp is None:
-        temps_raw = payload.get("servo_temps") or payload.get("temperatures") or payload.get("temps")
+        hottest = merged.get("hottest")
+        if (
+            isinstance(hottest, (list, tuple))
+            and len(hottest) >= 3
+            and isinstance(hottest[2], (int, float))
+            and not isinstance(hottest[2], bool)
+        ):
+            max_temp = float(hottest[2])
+    if max_temp is None:
+        temps_raw = merged.get("servo_temps") or merged.get("temperatures") or merged.get("temps")
         if isinstance(temps_raw, dict) and temps_raw:
-            numeric = [float(v) for v in temps_raw.values() if isinstance(v, (int, float))]
+            numeric = [
+                float(v)
+                for v in temps_raw.values()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            ]
             max_temp = max(numeric) if numeric else 0.0
         elif isinstance(temps_raw, list) and temps_raw:
-            numeric = [float(v) for v in temps_raw if isinstance(v, (int, float))]
+            numeric = [
+                float(v) for v in temps_raw if isinstance(v, (int, float)) and not isinstance(v, bool)
+            ]
             max_temp = max(numeric) if numeric else 0.0
         else:
             max_temp = 0.0
 
-    pitch = _first_float(payload, ("torso_pitch_deg", "pitch_deg", "pitch"))
+    pitch = _first_float(merged, ("torso_pitch_deg", "pitch_deg", "pitch"))
     if pitch is None:
         pitch = _first_float(imu, ("pitch_deg", "pitch"))
     if pitch is None:
-        pitch = _first_float(orientation, ("pitch_deg", "pitch"), default=0.0)
+        pitch = _first_float(orientation, ("pitch_deg", "pitch"))
 
-    roll = _first_float(payload, ("torso_roll_deg", "roll_deg", "roll"))
+    roll = _first_float(merged, ("torso_roll_deg", "roll_deg", "roll"))
     if roll is None:
         roll = _first_float(imu, ("roll_deg", "roll"))
     if roll is None:
-        roll = _first_float(orientation, ("roll_deg", "roll"), default=0.0)
+        roll = _first_float(orientation, ("roll_deg", "roll"))
 
-    standing_val = payload.get("standing", payload.get("is_standing", payload.get("upright")))
+    if pitch is None and roll is None:
+        scalar_tilt = _first_float(merged, ("tilt_deg", "torso_tilt_deg"))
+        if scalar_tilt is not None:
+            pitch = scalar_tilt
+            roll = 0.0
+
+    pitch = 0.0 if pitch is None else pitch
+    roll = 0.0 if roll is None else roll
+
+    standing_val = merged.get("standing", merged.get("is_standing", merged.get("upright")))
     if isinstance(standing_val, bool):
         standing = standing_val
-    elif isinstance(payload.get("posture"), str):
-        standing = payload["posture"].lower() not in {"fallen", "prone", "supine", "sitting"}
+    elif any(key in merged for key in ("lying", "asleep", "stop_latched")):
+        standing = (
+            (not bool(merged.get("lying", False)))
+            and (not bool(merged.get("asleep", False)))
+            and (not bool(merged.get("stop_latched", False)))
+        )
+    elif isinstance(merged.get("posture"), str):
+        standing = merged["posture"].lower() not in {"fallen", "prone", "supine", "sitting"}
     else:
         standing = True
 
     raw_servos = (
-        payload.get("servo_positions")
-        or payload.get("servos")
-        or payload.get("joints")
-        or payload.get("joint_positions")
-        or payload.get("positions")
+        merged.get("servo_positions")
+        or merged.get("servos")
+        or merged.get("joints")
+        or merged.get("joint_positions")
+        or merged.get("positions")
     )
     servo_positions = _normalize_servo_positions(raw_servos)
 
     return RobotStatus(
         battery_v=round(float(battery_v), 3),
         max_servo_temp_c=round(float(max_temp), 2),
-        torso_pitch_deg=round(float(pitch or 0.0), 2),
-        torso_roll_deg=round(float(roll or 0.0), 2),
+        torso_pitch_deg=round(float(pitch), 2),
+        torso_roll_deg=round(float(roll), 2),
         standing=standing,
         servo_positions=servo_positions,
         raw=dict(payload),
@@ -356,19 +391,22 @@ def _decode_base64_image(raw_b64: str, default_mime: str = "image/jpeg") -> tupl
 
 
 def _schema_prefers_servo_ids(tool_def: dict[str, Any]) -> bool:
-    """Detect whether a tool's inputSchema expects integer servo IDs (1..16) rather than names."""
+    """Detect whether a tool's description/inputSchema expects string servo IDs ('1'..'16')."""
     schema = tool_def.get("inputSchema")
-    if not isinstance(schema, dict):
-        return False
-    serialized = json.dumps(schema).lower()
-    if '"servo_ids"' in serialized or '"servo_id"' in serialized or '"by_id"' in serialized:
+    desc = str(tool_def.get("description") or "")
+    combined = (desc + " " + (json.dumps(schema) if isinstance(schema, dict) else "")).lower()
+    if '"servo_ids"' in combined or '"servo_id"' in combined or '"by_id"' in combined:
         return True
-    if "patternproperties" in serialized and ("^[0-9]" in serialized or "^\\d" in serialized):
+    if "patternproperties" in combined and ("^[0-9]" in combined or "^\\d" in combined):
+        return True
+    if _POS_NUMERIC_KEY_RE.search(combined):
         return True
     return (
-        "integer servo id" in serialized
-        or "servo id (1" in serialized
-        or "servo ids (1" in serialized
+        "integer servo id" in combined
+        or "servo id (1" in combined
+        or "servo ids (1" in combined
+        or "'1'..'16'" in combined
+        or '"1".."16"' in combined
     )
 
 
@@ -699,7 +737,8 @@ class TonypiMCPClient:
             return None
         schema = tool.get("inputSchema")
         props = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        use_ids = _schema_prefers_servo_ids(tool)
+        is_sim_motion = "simulate_motion" in str(tool.get("name", "")).lower()
+        use_ids = is_sim_motion or _schema_prefers_servo_ids(tool)
 
         frames_key = "frames"
         for cand in ("frames", "keyframes", "sequence"):
@@ -773,7 +812,8 @@ class TonypiMCPClient:
         props = schema.get("properties", {}) if isinstance(schema, dict) else {}
         tool_name_l = str(tool_def.get("name", "")).lower()
         is_play_frames = tool_name_l == "play_frames" or tool_name_l.endswith("_play_frames")
-        use_ids = _schema_prefers_servo_ids(tool_def)
+        # Both real tonypi-mcp and MujocoTonypiMCPServer accept string servo IDs "1".."16" in play_frames.
+        use_ids = is_play_frames or _schema_prefers_servo_ids(tool_def)
 
         frames_key = "frames" if is_play_frames else "keyframes"
         for cand in ("frames", "keyframes", "sequence", "steps"):
@@ -841,7 +881,7 @@ class TonypiMCPClient:
         props = schema.get("properties", {}) if isinstance(schema, dict) else {}
         tool_name_l = str(tool_def.get("name", "")).lower()
         is_set_pose = tool_name_l == "set_pose" or tool_name_l.endswith("_set_pose")
-        use_ids = _schema_prefers_servo_ids(tool_def)
+        use_ids = is_set_pose or _schema_prefers_servo_ids(tool_def)
 
         servo_key = "positions" if is_set_pose else "servos"
         for cand in ("positions", "pos", "servos", "joints", "targets", "servo_positions"):
